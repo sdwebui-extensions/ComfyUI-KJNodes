@@ -1502,3 +1502,124 @@ class ConsolidateMasksKJ:
         print(f"Consolidated {B} masks into {len(final_masks)}")
         return (torch.stack(final_masks, dim=0),)
 
+
+class DrawMaskOnImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "image": ("IMAGE", ),
+                    "mask": ("MASK", ),
+                    "color": ("STRING", {"default": "0, 0, 0", "tooltip": "Color as RGB values in range 0-255 or 0.0-1.0, separated by commas."}),
+                  }
+                }
+    
+    RETURN_TYPES = ("IMAGE", )
+    RETURN_NAMES = ("images",)
+    FUNCTION = "apply"
+    CATEGORY = "KJNodes/masking"
+    DESCRIPTION = "Applies the provided masks to the input images."
+
+    def apply(self, image, mask, color):
+        B, H, W, C = image.shape
+        BM, HM, WM = mask.shape
+
+        in_masks = mask.clone()
+        
+        if HM != H or WM != W:
+            in_masks = F.interpolate(mask.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
+        if B > BM:
+            in_masks = in_masks.repeat((B + BM - 1) // BM, 1, 1)[:B]
+        elif BM > B:
+            in_masks = in_masks[:B]
+        
+        output_images = []
+        
+        # Parse background color - detect if values are integers or floats
+        bg_values = []
+        for x in color.split(","):
+            val_str = x.strip()
+            if '.' in val_str:
+                bg_values.append(float(val_str))
+            else:
+                bg_values.append(int(val_str) / 255.0)
+
+        background_color = torch.tensor(bg_values, dtype=torch.float32, device=image.device)
+
+        for i in range(B):
+            curr_mask = in_masks[i]
+            img_idx = min(i, B - 1)
+            curr_image = image[img_idx]
+            mask_expanded = curr_mask.unsqueeze(-1).expand(-1, -1, 3)
+            masked_image = curr_image * (1 - mask_expanded) + background_color * (mask_expanded)
+            output_images.append(masked_image)
+        
+        # If no masks were processed, return empty tensor
+        if not output_images:
+            return (torch.zeros((0, H, W, 3), dtype=image.dtype),)
+
+        out_rgb = torch.stack(output_images, dim=0)
+        
+        return (out_rgb, )
+
+
+class BlockifyMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "masks": ("MASK",),
+                    "block_size": ("INT", {"default": 32, "min": 8, "max": 512, "step": 1, "tooltip": "Size of blocks in pixels (smaller = smaller blocks)"}),
+                }
+                }
+
+    RETURN_TYPES = ("MASK", )
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "process"
+    CATEGORY = "KJNodes/masking"
+    DESCRIPTION = "Creates a block mask by dividing the bounding box of each mask into blocks of the specified size and filling in blocks that contain any part of the original mask."
+
+    def process(self, masks, block_size):
+        batch_size = masks.shape[0]
+        result_masks = []
+        
+        for i in range(batch_size):
+            mask = masks[i]
+            
+            # Find bounding box using tensor operations
+            nonzero_coords = torch.nonzero(mask, as_tuple=True)
+            if len(nonzero_coords[0]) == 0:  # Empty mask
+                result_masks.append(mask)
+                continue
+                
+            y_coords, x_coords = nonzero_coords
+            y_min, y_max = y_coords.min(), y_coords.max()
+            x_min, x_max = x_coords.min(), x_coords.max()
+            
+            bbox_width = x_max - x_min + 1
+            bbox_height = y_max - y_min + 1
+            
+            # Calculate number of blocks that fit
+            w_divisions = max(1, bbox_width // block_size)
+            h_divisions = max(1, bbox_height // block_size)
+            
+            # Calculate actual block sizes (might be slightly larger than block_size)
+            w_slice = bbox_width // w_divisions
+            h_slice = bbox_height // h_divisions
+            
+            # Create output mask (copy of input)
+            output_mask = mask.clone()
+            
+            # Process grid cells
+            for w_start in range(x_min, x_max + 1, w_slice):
+                w_end = min(w_start + w_slice, x_max + 1)
+                for h_start in range(y_min, y_max + 1, h_slice):
+                    h_end = min(h_start + h_slice, y_max + 1)
+                    
+                    # Check if this cell contains any mask content
+                    cell_region = mask[h_start:h_end, w_start:w_end]
+                    if cell_region.sum() > 0:
+                        # Fill the entire cell
+                        output_mask[h_start:h_end, w_start:w_end] = 1.0
+            
+            result_masks.append(output_mask)
+        
+        return torch.stack(result_masks, dim=0),
