@@ -17,7 +17,7 @@ except ImportError:
     v3_available = False
     logging.warning("ComfyUI v3 node API not available, please update ComfyUI to access latest v3 nodes.")
 
-sageattn_modes = ["disabled", "auto", "sageattn_qk_int8_pv_fp16_cuda", "sageattn_qk_int8_pv_fp16_triton", "sageattn_qk_int8_pv_fp8_cuda", "sageattn_qk_int8_pv_fp8_cuda++"]
+sageattn_modes = ["disabled", "auto", "sageattn_qk_int8_pv_fp16_cuda", "sageattn_qk_int8_pv_fp16_triton", "sageattn_qk_int8_pv_fp8_cuda", "sageattn_qk_int8_pv_fp8_cuda++", "sageattn3", "sageattn3_per_block_mean"]
 
 _initialized = False
 _original_functions = {}
@@ -117,6 +117,15 @@ class BaseLoaderKJ:
                     from sageattention import sageattn_qk_int8_pv_fp8_cuda
                     def func(q, k, v, is_causal=False, attn_mask=None, tensor_layout="NHD"):
                         return sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=is_causal, attn_mask=attn_mask, pv_accum_dtype="fp32+fp16", tensor_layout=tensor_layout)
+                    return func
+                elif "sageattn3" in sage_attention:
+                    from sageattn3 import sageattn3_blackwell
+                    if sage_attention == "sageattn3_per_block_mean":
+                        def func(q, k, v, is_causal=False, attn_mask=None, **kwargs):
+                            return sageattn3_blackwell(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=is_causal, attn_mask=attn_mask, per_block_mean=True).transpose(1, 2)
+                    else:
+                        def func(q, k, v, is_causal=False, attn_mask=None, **kwargs):
+                            return sageattn3_blackwell(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=is_causal, attn_mask=attn_mask, per_block_mean=False).transpose(1, 2)
                     return func
 
             sage_func = set_sage_func(sage_attention)
@@ -440,7 +449,7 @@ class DiffusionModelLoaderKJ(BaseLoaderKJ):
             if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
                 torch.backends.cuda.matmul.allow_fp16_accumulation = True
             else:
-                raise RuntimeError("Failed to set fp16 accumulation, this requires pytorch 2.7.0 nightly currently")
+                raise RuntimeError("Failed to set fp16 accumulation, this requires pytorch 2.7.1 or higher")
         else:
             if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
                 torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -494,12 +503,12 @@ class ModelPatchTorchSettings:
                 model_clone.add_callback(CallbacksMP.ON_PRE_RUN, patch_enable_fp16_accum)
                 model_clone.add_callback(CallbacksMP.ON_CLEANUP, patch_disable_fp16_accum)
             else:
-                raise RuntimeError("Failed to set fp16 accumulation, this requires pytorch 2.7.0 nightly currently")
+                raise RuntimeError("Failed to set fp16 accumulation, this requires pytorch 2.7.1 or higher")
         else:
             if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
                 model_clone.add_callback(CallbacksMP.ON_PRE_RUN, patch_disable_fp16_accum)
             else:
-                raise RuntimeError("Failed to set fp16 accumulation, this requires pytorch 2.7.0 nightly currently")
+                raise RuntimeError("Failed to set fp16 accumulation, this requires pytorch 2.7.1 or higher")
                 
         return (model_clone,)
     
@@ -700,6 +709,7 @@ class TorchCompileModelFluxAdvancedV2:
                 },
                 "optional": {
                     "dynamo_cache_size_limit": ("INT", {"default": 64, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.cache_size_limit"}),
+                    "force_parameter_static_shapes": ("BOOLEAN", {"default": True, "tooltip": "torch._dynamo.config.force_parameter_static_shapes"}),
                 }
                 }
     RETURN_TYPES = ("MODEL",)
@@ -708,11 +718,12 @@ class TorchCompileModelFluxAdvancedV2:
     CATEGORY = "KJNodes/torchcompile"
     EXPERIMENTAL = True
 
-    def patch(self, model, backend, mode, fullgraph, single_blocks, double_blocks, dynamic, dynamo_cache_size_limit):
+    def patch(self, model, backend, mode, fullgraph, single_blocks, double_blocks, dynamic, dynamo_cache_size_limit=64, force_parameter_static_shapes=True):
         from comfy_api.torch_helpers import set_torch_compile_wrapper
         m = model.clone()
         diffusion_model = m.get_model_object("diffusion_model")
         torch._dynamo.config.cache_size_limit = dynamo_cache_size_limit
+        torch._dynamo.config.force_parameter_static_shapes = force_parameter_static_shapes
 
         compile_key_list = []
         
@@ -863,6 +874,10 @@ class TorchCompileModelWanVideoV2:
                 "dynamic": ("BOOLEAN", {"default": False, "tooltip": "Enable dynamic mode"}),
                 "compile_transformer_blocks_only": ("BOOLEAN", {"default": True, "tooltip": "Compile only transformer blocks, faster compile and less error prone"}),
                 "dynamo_cache_size_limit": ("INT", {"default": 64, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.cache_size_limit"}),
+                
+            },
+            "optional": {
+                "force_parameter_static_shapes": ("BOOLEAN", {"default": True, "tooltip": "torch._dynamo.config.force_parameter_static_shapes"}),
             },
         }
     RETURN_TYPES = ("MODEL",)
@@ -871,11 +886,12 @@ class TorchCompileModelWanVideoV2:
     CATEGORY = "KJNodes/torchcompile"
     EXPERIMENTAL = True
 
-    def patch(self, model, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only):
+    def patch(self, model, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, force_parameter_static_shapes=True):
         from comfy_api.torch_helpers import set_torch_compile_wrapper
         m = model.clone()
         diffusion_model = m.get_model_object("diffusion_model")
-        torch._dynamo.config.cache_size_limit = dynamo_cache_size_limit            
+        torch._dynamo.config.cache_size_limit = dynamo_cache_size_limit
+        torch._dynamo.config.force_parameter_static_shapes = force_parameter_static_shapes
         try:
             if compile_transformer_blocks_only:
                 compile_key_list = []
@@ -1924,14 +1940,20 @@ if v3_available:
     class GGUFLoaderKJ(io.ComfyNode):
         @classmethod
         def define_schema(cls):
+            # Get GGUF models safely, fallback to empty list if unet_gguf folder doesn't exist
+            try:
+                gguf_models = folder_paths.get_filename_list("unet_gguf")
+            except KeyError:
+                gguf_models = []
+            
             return io.Schema(
                 node_id="GGUFLoaderKJ",
                 category="KJNodes/experimental",
                 description="Loads a GGUF model with advanced options, requires [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) to be installed.",
                 is_experimental=True,
                 inputs=[
-                    io.Combo.Input("model_name", options=[x for x in folder_paths.get_filename_list("unet_gguf")]),
-                    io.Combo.Input("extra_model_name", options=[x for x in folder_paths.get_filename_list("unet_gguf")] + ["none"], default="none", tooltip="An extra gguf model to load and merge into the main model, for example VACE module"),
+                    io.Combo.Input("model_name", options=gguf_models),
+                    io.Combo.Input("extra_model_name", options=gguf_models + ["none"], default="none", tooltip="An extra gguf model to load and merge into the main model, for example VACE module"),
                     io.Combo.Input("dequant_dtype", options=["default", "target", "float32", "float16", "bfloat16"], default="default"),
                     io.Combo.Input("patch_dtype", options=["default", "target", "float32", "float16", "bfloat16"], default="default"),
                     io.Boolean.Input("patch_on_device", default=False),
