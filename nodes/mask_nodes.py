@@ -1575,7 +1575,7 @@ class DrawMaskOnImage:
                 mask_expanded = curr_mask.unsqueeze(-1).expand(-1, -1, 3)
                 masked_image = curr_image * (1 - mask_expanded) + background_color * (mask_expanded)
                 output_images.append(masked_image)
-            if not output_images:
+            if output_images:
                 out_rgb = torch.stack(output_images, dim=0).cpu()
         # If no masks were processed, return empty tensor
         if not output_images:
