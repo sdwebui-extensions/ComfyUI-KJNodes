@@ -14,6 +14,7 @@ from comfy.utils import common_upscale
 from nodes import MAX_RESOLUTION
 
 import folder_paths
+from dist_utils import args, tensor_chunk, all_gather, all_all, all_all_async, conv3d_p2pop, conv2d_p2pop, tensor_boradcast, tensor_chunk_send
 
 from ..utility.utility import tensor2pil, pil2tensor
 
@@ -1540,45 +1541,55 @@ class DrawMaskOnImage:
     def apply(self, image, mask, color, device="cpu"):
         B, H, W, C = image.shape
         BM, HM, WM = mask.shape
+        if args.rank==0 or args.world_size<2:
 
-        processing_device = main_device if device == "gpu" else torch.device("cpu")
+            processing_device = main_device if device == "gpu" else torch.device("cpu")
 
-        in_masks = mask.clone().to(processing_device)
-        in_images = image.clone().to(processing_device)
-        
-        if HM != H or WM != W:
-            in_masks = F.interpolate(mask.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
-        if B > BM:
-            in_masks = in_masks.repeat((B + BM - 1) // BM, 1, 1)[:B]
-        elif BM > B:
-            in_masks = in_masks[:B]
-        
-        output_images = []
-        
-        # Parse background color - detect if values are integers or floats
-        bg_values = []
-        for x in color.split(","):
-            val_str = x.strip()
-            if '.' in val_str:
-                bg_values.append(float(val_str))
-            else:
-                bg_values.append(int(val_str) / 255.0)
+            in_masks = mask.clone().to(processing_device)
+            in_images = image.clone().to(processing_device)
+            
+            if HM != H or WM != W:
+                in_masks = F.interpolate(mask.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
+            if B > BM:
+                in_masks = in_masks.repeat((B + BM - 1) // BM, 1, 1)[:B]
+            elif BM > B:
+                in_masks = in_masks[:B]
+            
+            output_images = []
+            
+            # Parse background color - detect if values are integers or floats
+            bg_values = []
+            for x in color.split(","):
+                val_str = x.strip()
+                if '.' in val_str:
+                    bg_values.append(float(val_str))
+                else:
+                    bg_values.append(int(val_str) / 255.0)
 
-        background_color = torch.tensor(bg_values, dtype=torch.float32, device=in_images.device)
+            background_color = torch.tensor(bg_values, dtype=torch.float32, device=in_images.device)
 
-        for i in tqdm(range(B), desc="DrawMaskOnImage batch"):
-            curr_mask = in_masks[i]
-            img_idx = min(i, B - 1)
-            curr_image = in_images[img_idx]
-            mask_expanded = curr_mask.unsqueeze(-1).expand(-1, -1, 3)
-            masked_image = curr_image * (1 - mask_expanded) + background_color * (mask_expanded)
-            output_images.append(masked_image)
-        
+            for i in tqdm(range(B), desc="DrawMaskOnImage batch"):
+                curr_mask = in_masks[i]
+                img_idx = min(i, B - 1)
+                curr_image = in_images[img_idx]
+                mask_expanded = curr_mask.unsqueeze(-1).expand(-1, -1, 3)
+                masked_image = curr_image * (1 - mask_expanded) + background_color * (mask_expanded)
+                output_images.append(masked_image)
+            if not output_images:
+                out_rgb = torch.stack(output_images, dim=0).cpu()
         # If no masks were processed, return empty tensor
         if not output_images:
             return (torch.zeros((0, H, W, 3), dtype=image.dtype),)
-
-        out_rgb = torch.stack(output_images, dim=0).cpu()
+        
+        if args.world_size>1:
+            if args.rank==0:
+                torch.save(out_rgb, "out_rgb.pth")
+            torch.distributed.barrier()
+            if args.rank!=0:
+                out_rgb = torch.load("out_rgb.pth")
+            torch.distributed.barrier()
+            if args.rank==0:
+                os.remove("out_rgb.pth")
         
         return (out_rgb, )
 
