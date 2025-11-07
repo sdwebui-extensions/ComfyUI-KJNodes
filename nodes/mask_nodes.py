@@ -1541,55 +1541,45 @@ class DrawMaskOnImage:
     def apply(self, image, mask, color, device="cpu"):
         B, H, W, C = image.shape
         BM, HM, WM = mask.shape
-        if args.rank==0 or args.world_size<2:
-
-            processing_device = main_device if device == "gpu" else torch.device("cpu")
-
-            in_masks = mask.clone().to(processing_device)
-            in_images = image.clone().to(processing_device)
-            
-            if HM != H or WM != W:
-                in_masks = F.interpolate(mask.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
-            if B > BM:
-                in_masks = in_masks.repeat((B + BM - 1) // BM, 1, 1)[:B]
-            elif BM > B:
-                in_masks = in_masks[:B]
-            
-            output_images = []
-            
-            # Parse background color - detect if values are integers or floats
-            bg_values = []
-            for x in color.split(","):
-                val_str = x.strip()
-                if '.' in val_str:
-                    bg_values.append(float(val_str))
-                else:
-                    bg_values.append(int(val_str) / 255.0)
-
-            background_color = torch.tensor(bg_values, dtype=torch.float32, device=in_images.device)
-
-            for i in tqdm(range(B), desc="DrawMaskOnImage batch"):
-                curr_mask = in_masks[i]
-                img_idx = min(i, B - 1)
-                curr_image = in_images[img_idx]
-                mask_expanded = curr_mask.unsqueeze(-1).expand(-1, -1, 3)
-                masked_image = curr_image * (1 - mask_expanded) + background_color * (mask_expanded)
-                output_images.append(masked_image)
-            if output_images:
-                out_rgb = torch.stack(output_images, dim=0).cpu()
-        # If no masks were processed, return empty tensor
-        if not output_images:
+        if B < 1:
             return (torch.zeros((0, H, W, 3), dtype=image.dtype),)
+
+        processing_device = main_device if device == "gpu" else torch.device("cpu")
+
+        in_masks = mask.clone().to(processing_device)
+        in_images = image.clone().to(processing_device)
+        
+        if HM != H or WM != W:
+            in_masks = F.interpolate(mask.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
+        if B > BM:
+            in_masks = in_masks.repeat((B + BM - 1) // BM, 1, 1)[:B]
+        elif BM > B:
+            in_masks = in_masks[:B]
+        
+        output_images = []
+        
+        # Parse background color - detect if values are integers or floats
+        bg_values = []
+        for x in color.split(","):
+            val_str = x.strip()
+            if '.' in val_str:
+                bg_values.append(float(val_str))
+            else:
+                bg_values.append(int(val_str) / 255.0)
+
+        background_color = torch.tensor(bg_values, dtype=torch.float32, device=in_images.device)
+
+        for i in tqdm(range(B), desc="DrawMaskOnImage batch"):
+            curr_mask = in_masks[i]
+            img_idx = min(i, B - 1)
+            curr_image = in_images[img_idx]
+            mask_expanded = curr_mask.unsqueeze(-1).expand(-1, -1, 3)
+            masked_image = curr_image * (1 - mask_expanded) + background_color * (mask_expanded)
+            output_images.append(masked_image)
+        out_rgb = torch.stack(output_images, dim=0).cpu()
         
         if args.world_size>1:
-            if args.rank==0:
-                torch.save(out_rgb, "out_rgb.pth")
             torch.distributed.barrier()
-            if args.rank!=0:
-                out_rgb = torch.load("out_rgb.pth")
-            torch.distributed.barrier()
-            if args.rank==0:
-                os.remove("out_rgb.pth")
         
         return (out_rgb, )
 
