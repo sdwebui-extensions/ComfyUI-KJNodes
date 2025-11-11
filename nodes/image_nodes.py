@@ -237,10 +237,6 @@ Concatenates the image2 to image1 in the specified direction.
 
     def concatenate(self, image1, image2, direction, match_image_size, first_image_shape=None):
         # Check if the batch sizes are different
-        if dist_args.world_size > 1 and dist_args.only_sampler:
-            if args.rank > 0:
-                image1 = image1[:100]
-                image2 = image2[:100]
         batch_size1 = image1.shape[0]
         batch_size2 = image2.shape[0]
 
