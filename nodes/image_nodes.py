@@ -306,8 +306,6 @@ Concatenates the image2 to image1 in the specified direction.
             concatenated_image = torch.cat((image2_resized, image1), dim=2)  # Concatenate along width
         elif direction == 'up':
             concatenated_image = torch.cat((image2_resized, image1), dim=1)  # Concatenate along height
-        if dist_args.world_size > 1:
-            torch.distributed.barrier()
         return concatenated_image,
 
 import torch  # Make sure you have PyTorch installed
