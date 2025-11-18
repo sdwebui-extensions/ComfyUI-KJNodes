@@ -1578,8 +1578,6 @@ class DrawMaskOnImage:
             output_images.append(masked_image)
         out_rgb = torch.stack(output_images, dim=0).cpu()
         
-        if args.world_size>1:
-            torch.distributed.barrier()
         
         return (out_rgb, )
 
