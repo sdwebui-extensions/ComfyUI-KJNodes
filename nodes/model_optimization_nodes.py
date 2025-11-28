@@ -3,14 +3,16 @@ from comfy.ldm.modules import attention as comfy_attention
 import logging
 import torch
 import importlib
+import math
 
 import folder_paths
 import comfy.model_management as mm
 from comfy.cli_args import args
-from comfy.ldm.modules.attention import wrap_attn
+from comfy.ldm.modules.attention import wrap_attn, optimized_attention
 import comfy.model_patcher
 import comfy.utils
 import comfy.sd
+
 
 try:
     from comfy_api.latest import io
@@ -71,6 +73,9 @@ def get_sage_func(sage_attention, allow_compile=False):
 
     @wrap_attn
     def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+        in_dtype = v.dtype
+        if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
+            q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
         if skip_reshape:
             b, _, _, dim_head = q.shape
             tensor_layout="HND"
@@ -89,7 +94,7 @@ def get_sage_func(sage_attention, allow_compile=False):
             # add a heads dimension if there isn't already one
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
-        out = sage_func(q, k, v, attn_mask=mask, is_causal=False, tensor_layout=tensor_layout)
+        out = sage_func(q, k, v, attn_mask=mask, is_causal=False, tensor_layout=tensor_layout).to(in_dtype)
         if tensor_layout == "HND":
             if not skip_output_reshape:
                 out = (
@@ -391,6 +396,14 @@ class DiffusionModelLoaderKJ(BaseLoaderKJ):
     
         sd = comfy.utils.load_torch_file(unet_path)
         if extra_state_dict is not None:
+            # If the model is a checkpoint, strip additional non-diffusion model entries before adding extra state dict
+            from comfy import model_detection
+            diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
+            if diffusion_model_prefix == "model.diffusion_model.":
+                temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
+                if len(temp_sd) > 0:
+                    sd = temp_sd
+            
             extra_sd = comfy.utils.load_torch_file(extra_state_dict)
             sd.update(extra_sd)
             del extra_sd
@@ -667,6 +680,7 @@ class TorchCompileModelFluxAdvancedV2:
         try:
             if double_blocks:
                 for i, block in enumerate(diffusion_model.double_blocks):
+                    print("Adding double block to compile list", i)
                     compile_key_list.append(f"diffusion_model.double_blocks.{i}")
             if single_blocks:
                 for i, block in enumerate(diffusion_model.single_blocks):
@@ -710,7 +724,7 @@ class TorchCompileModelHyVideo:
         }
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
-
+    DEPRECATED = True
     CATEGORY = "KJNodes/torchcompile"
     EXPERIMENTAL = True
 
@@ -842,7 +856,60 @@ class TorchCompileModelWanVideoV2:
             raise RuntimeError("Failed to compile model")
 
         return (m, )
-    
+
+
+class TorchCompileModelAdvanced:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "backend": (["inductor","cudagraphs"], {"default": "inductor"}),
+                "fullgraph": ("BOOLEAN", {"default": False, "tooltip": "Enable full graph mode"}),
+                "mode": (["default", "max-autotune", "max-autotune-no-cudagraphs", "reduce-overhead"], {"default": "default"}),
+                "dynamic": ("BOOLEAN", {"default": False, "tooltip": "Enable dynamic mode"}),
+                "compile_transformer_blocks_only": ("BOOLEAN", {"default": True, "tooltip": "Compile only transformer blocks, faster compile and less error prone"}),
+                "dynamo_cache_size_limit": ("INT", {"default": 64, "min": 0, "max": 1024, "step": 1, "tooltip": "torch._dynamo.config.cache_size_limit"}),
+                "debug_compile_keys": ("BOOLEAN", {"default": False, "tooltip": "Print the compile keys used for torch.compile"}),
+            },
+        }
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "KJNodes/torchcompile"
+    DESCRIPTION = "Advanced torch.compile patching for diffusion models."
+    EXPERIMENTAL = True
+
+    def patch(self, model, backend, fullgraph, mode, dynamic, dynamo_cache_size_limit, compile_transformer_blocks_only, debug_compile_keys):
+        from comfy_api.torch_helpers import set_torch_compile_wrapper
+        m = model.clone()
+        diffusion_model = m.get_model_object("diffusion_model")
+        torch._dynamo.config.cache_size_limit = dynamo_cache_size_limit   
+
+        try:
+            if compile_transformer_blocks_only:
+                layer_types = ["double_blocks", "single_blocks", "layers", "transformer_blocks", "blocks", "visual_transformer_blocks", "text_transformer_blocks"]
+                compile_key_list = []
+                for layer_name in layer_types:
+                    if hasattr(diffusion_model, layer_name):
+                        blocks = getattr(diffusion_model, layer_name)
+                        for i in range(len(blocks)):
+                            compile_key_list.append(f"diffusion_model.{layer_name}.{i}")
+                if not compile_key_list:
+                    logging.warning("No known transformer blocks found to compile, compiling entire diffusion model instead")
+                elif debug_compile_keys:
+                    logging.info("TorchCompileModelAdvanced: Compile key list:")
+                    for key in compile_key_list:
+                        logging.info(f" - {key}")
+            if not compile_key_list:
+                compile_key_list =["diffusion_model"]
+
+            set_torch_compile_wrapper(model=m, keys=compile_key_list, backend=backend, mode=mode, dynamic=dynamic, fullgraph=fullgraph)           
+        except:
+            raise RuntimeError("Failed to compile model")
+
+        return (m, )
+
+
 class TorchCompileModelQwenImage:
     @classmethod
     def INPUT_TYPES(s):
@@ -1997,3 +2064,126 @@ else:
         FUNCTION = ""
         CATEGORY = ""
         DESCRIPTION = "This node requires newer ComfyUI"
+
+
+try:
+    from torch.nn.attention.flex_attention import flex_attention, BlockMask
+except:
+    flex_attention = None
+    BlockMask = None
+
+class NABLA_AttentionKJ():
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "model": ("MODEL",),
+            "latent": ("LATENT", {"tooltip": "Only used to get the latent shape"}),
+            "window_time": ("INT", {"default": 11, "min": 1, "tooltip": "Temporal attention window size"}),
+            "window_width": ("INT", {"default": 3, "min": 1, "tooltip": "Spatial attention window size"}),
+            "window_height": ("INT", {"default": 3, "min": 1, "tooltip": "Spatial attention window size"}),
+            "sparsity": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "torch_compile": ("BOOLEAN", {"default": True, "tooltip": "Most likely required for reasonable memory usage"})
+        },
+        }
+
+    RETURN_TYPES = ("MODEL", )
+    FUNCTION = "patch"
+    DESCRIPTION = "Experimental node for patching attention mode to use NABLA sparse attention for video models, currently only works with Kadinsky5"
+    CATEGORY = "KJNodes/experimental"
+
+    def patch(self, model, latent, window_time, window_width, window_height, sparsity, torch_compile):
+        if flex_attention is None or BlockMask is None:
+            raise RuntimeError("can't import flex_attention from torch.nn.attention, requires newer pytorch version")
+
+        model_clone = model.clone()
+        samples = latent["samples"]
+
+        sparse_params = get_sparse_params(samples, window_time, window_height, window_width, sparsity)
+        nabla_attention = NABLA_Attention(sparse_params)
+
+        def attention_override_nabla(func, *args, **kwargs):
+            return nabla_attention(*args, **kwargs)
+        
+        if torch_compile:
+            attention_override_nabla = torch.compile(attention_override_nabla, mode="max-autotune-no-cudagraphs", dynamic=True)
+
+        # attention override
+        model_clone.model_options["transformer_options"]["optimized_attention_override"] = attention_override_nabla
+
+        return model_clone,
+
+
+class NABLA_Attention():
+    def __init__(self, sparse_params):
+        self.sparse_params = sparse_params
+
+    def __call__(self, q, k, v, heads, **kwargs):
+        if q.shape[-2] < 3000 or k.shape[-2] < 3000:
+            return optimized_attention(q, k, v, heads, **kwargs)
+        block_mask = self.nablaT_v2(q, k, self.sparse_params["sta_mask"], thr=self.sparse_params["P"])
+        out = flex_attention(q, k, v, block_mask=block_mask).transpose(1, 2).contiguous().flatten(-2, -1)
+        return out
+
+    def nablaT_v2(self, q, k, sta, thr=0.9):
+        # Map estimation
+        BLOCK_SIZE = 64
+        B, h, S, D = q.shape
+        s1 = S // BLOCK_SIZE
+        qa = q.reshape(B, h, s1, BLOCK_SIZE, D).mean(-2)
+        ka = k.reshape(B, h, s1, BLOCK_SIZE, D).mean(-2).transpose(-2, -1)
+        map = qa @ ka
+
+        map = torch.softmax(map / math.sqrt(D), dim=-1)
+        # Map binarization
+        vals, inds = map.sort(-1)
+        cvals = vals.cumsum_(-1)
+        mask = (cvals >= 1 - thr).int()
+        mask = mask.gather(-1, inds.argsort(-1))
+
+        mask = torch.logical_or(mask, sta)
+
+        # BlockMask creation
+        kv_nb = mask.sum(-1).to(torch.int32)
+        kv_inds = mask.argsort(dim=-1, descending=True).to(torch.int32)
+        return BlockMask.from_kv_blocks(torch.zeros_like(kv_nb), kv_inds, kv_nb, kv_inds, BLOCK_SIZE=BLOCK_SIZE, mask_mod=None)
+    
+def fast_sta_nabla(T, H, W, wT=3, wH=3, wW=3):
+    l = torch.Tensor([T, H, W]).amax()
+    r = torch.arange(0, l, 1, dtype=torch.int16, device=mm.get_torch_device())
+    mat = (r.unsqueeze(1) - r.unsqueeze(0)).abs()
+    sta_t, sta_h, sta_w = (
+        mat[:T, :T].flatten(),
+        mat[:H, :H].flatten(),
+        mat[:W, :W].flatten(),
+    )
+    sta_t = sta_t <= wT // 2
+    sta_h = sta_h <= wH // 2
+    sta_w = sta_w <= wW // 2
+    sta_hw = (sta_h.unsqueeze(1) * sta_w.unsqueeze(0)).reshape(H, H, W, W).transpose(1, 2).flatten()
+    sta = (sta_t.unsqueeze(1) * sta_hw.unsqueeze(0)).reshape(T, T, H * W, H * W).transpose(1, 2)
+    return sta.reshape(T * H * W, T * H * W)
+
+
+def get_sparse_params(x, wT, wH, wW, sparsity=0.9):
+    B, C, T, H, W = x.shape
+    print("x shape:", x.shape)
+    patch_size = (1, 2, 2)
+    T, H, W = (
+        T // patch_size[0],
+        H // patch_size[1],
+        W // patch_size[2],
+    )
+    sta_mask = fast_sta_nabla(T, H // 8, W // 8, wT, wH, wW)
+    sparse_params = {
+        "sta_mask": sta_mask.unsqueeze_(0).unsqueeze_(0),
+        "to_fractal": True,
+        "P": sparsity,
+        "wT": wT,
+        "wH": wH,
+        "wW": wW,
+        "add_sta": True,
+        "visual_shape": (T, H, W),
+        "method": "topcdf",
+    }
+
+    return sparse_params
