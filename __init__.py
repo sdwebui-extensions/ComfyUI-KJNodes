@@ -129,10 +129,10 @@ NODE_CONFIG = {
     "AppendStringsToList": {"class": AppendStringsToList, "name": "Append Strings To List"},
     "JoinStrings": {"class": JoinStrings, "name": "Join Strings"},
     "JoinStringMulti": {"class": JoinStringMulti, "name": "Join String Multi"},
+    "SimpleCalculatorKJ": {"class": SimpleCalculatorKJ, "name": "Simple Calculator KJ"},
     "SomethingToString": {"class": SomethingToString, "name": "Something To String"},
     "Sleep": {"class": Sleep, "name": "Sleep"},
     "VRAM_Debug": {"class": VRAM_Debug, "name": "VRAM Debug"},
-    "SomethingToString": {"class": SomethingToString, "name": "Something To String"},
     "EmptyLatentImagePresets": {"class": EmptyLatentImagePresets, "name": "Empty Latent Image Presets"},
     "EmptyLatentImageCustomPresets": {"class": EmptyLatentImageCustomPresets, "name": "Empty Latent Image Custom Presets"},
     "ModelPassThrough": {"class": ModelPassThrough, "name": "ModelPass"},
@@ -212,6 +212,9 @@ NODE_CONFIG = {
     "LatentInpaintTTM": {"class": LatentInpaintTTM, "name": "Latent Inpaint TTM"},
     "NABLA_AttentionKJ": {"class": NABLA_AttentionKJ, "name": "NABLA Attention KJ"},
     "TorchCompileModelAdvanced": {"class": TorchCompileModelAdvanced, "name": "TorchCompileModelAdvanced"},
+    "StartRecordCUDAMemoryHistory": {"class": StartRecordCUDAMemoryHistory, "name": "Start Recording CUDAMemory History"},
+    "EndRecordCUDAMemoryHistory": {"class": EndRecordCUDAMemoryHistory, "name": "End Recording CUDAMemory History"},
+    "VisualizeCUDAMemoryHistory": {"class": VisualizeCUDAMemoryHistory, "name": "Visualize CUDAMemory History"},
 
     #instance diffusion
     "CreateInstanceDiffusionTracking": {"class": CreateInstanceDiffusionTracking},
@@ -220,7 +223,11 @@ NODE_CONFIG = {
 
     #lora
     "LoraExtractKJ": {"class": LoraExtractKJ, "name": "LoraExtractKJ"},
-    "LoraReduceRankKJ": {"class": LoraReduceRank, "name": "LoraReduceRank"}
+    "LoraReduceRankKJ": {"class": LoraReduceRank, "name": "LoraReduceRank"},
+
+    #tracks
+    "GetTrackRange": {"class": GetTrackRange, "name": "Get Track Range"},
+    "AddNoiseToTrackPath": {"class": AddNoiseToTrackPath, "name": "Add Noise To Track"},
 }
 
 def generate_node_mappings(node_config):
