@@ -11,6 +11,7 @@ from nodes import MAX_RESOLUTION
 from comfy.utils import common_upscale, ProgressBar, load_torch_file
 from comfy.comfy_types.node_typing import IO
 from comfy_api.latest import io
+from io import BytesIO
 
 script_directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 folder_paths.add_model_folder_path("kjnodes_fonts", os.path.join(script_directory, "fonts"))
@@ -212,7 +213,7 @@ Combines multiple conditioning nodes into one
         for c in range(1, inputcount):
             new_cond = kwargs[f"conditioning_{c + 1}"]
             if operation == "combine":
-                cond = cond_combine_node.combine(new_cond, cond)[0]
+                cond = cond_combine_node.combine(cond, new_cond)[0]
             elif operation == "concat":
                 cond = cond_concat_node.concat(cond, new_cond)[0]
         return (cond, inputcount,)
@@ -1632,7 +1633,7 @@ or a .txt file with RealEstate camera intrinsics and coordinates, in a 3D plot.
         
         plt.title('')
         plt.draw()
-        buf = io.BytesIO()
+        buf = BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
         buf.seek(0)
         img = Image.open(buf)
@@ -2728,7 +2729,7 @@ class SimpleCalculatorKJ:
 
         # Allowed operations
         allowed_operators = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,  ast.Div: operator.truediv,
-            ast.Pow: operator.pow, ast.USub: operator.neg, ast.UAdd: operator.pos,
+            ast.Pow: operator.pow, ast.USub: operator.neg, ast.UAdd: operator.pos, ast.LShift: operator.lshift, ast.RShift: operator.rshift,
         }
 
         # Allowed functions
@@ -2872,3 +2873,44 @@ class AddNoiseToTrackPath(io.ComfyNode):
             "track_visibility": mask,
         }
         return io.NodeOutput(out_track)
+
+
+class VAEDecodeLoopKJ:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "samples": ("LATENT", {"tooltip": "The latent to be decoded."}),
+                "vae": ("VAE", {"tooltip": "The VAE model used for decoding the latent."}),
+                "overlap_latent_frames": ("INT", {"default": 2, "min": 2, "max": 8, "step": 1, "tooltip": "Number of frames to blend for seamless loop, for Wan 2 works and HunyuanVideo 1.5 should use 4"}),
+            }
+        }
+    RETURN_TYPES = ("IMAGE",)
+    OUTPUT_TOOLTIPS = ("The decoded images.",)
+    FUNCTION = "decode"
+    CATEGORY = "KJNodes/vae"
+    DESCRIPTION = "Video latent VAE decoding to fix artifacts on loop seams."
+
+    def decode(self, vae, samples, overlap_latent_frames):
+        latents = samples["samples"]
+
+        images = vae.decode(latents)
+        if overlap_latent_frames <= 0:
+            if len(images.shape) == 5:
+                images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+            return (images, )
+
+        end_frames = overlap_latent_frames + 1
+        start_frames = overlap_latent_frames
+
+        temp_images = vae.decode(torch.cat([latents[:, :, -end_frames:]] + [latents[:, :, :start_frames]], dim=2)).cpu().float()
+
+        total_concat = end_frames + start_frames
+        temp_start = total_concat * 2 - 1
+        main_start = total_concat + (overlap_latent_frames if overlap_latent_frames > 2 else 0)
+
+        images = torch.cat([temp_images[:, temp_start:].to(images), images[:, main_start:]], dim=1)
+        if len(images.shape) == 5:
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+
+        return (images, )
