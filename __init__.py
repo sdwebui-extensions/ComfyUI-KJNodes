@@ -21,6 +21,7 @@ NODE_CONFIG = {
     "ConditioningSetMaskAndCombine4": {"class": ConditioningSetMaskAndCombine4, "name": "ConditioningSetMaskAndCombine4"},
     "ConditioningSetMaskAndCombine5": {"class": ConditioningSetMaskAndCombine5, "name": "ConditioningSetMaskAndCombine5"},
     "CondPassThrough": {"class": CondPassThrough},
+    "WanImageToVideoSVIPro": {"class": WanImageToVideoSVIPro, "name": "Wan Image To Video SVIPro"},
     #masking
     "DrawMaskOnImage": {"class": DrawMaskOnImage, "name": "Draw Mask On Image"},
     "DownloadAndLoadCLIPSeg": {"class": DownloadAndLoadCLIPSeg, "name": "(Down)load CLIPSeg"},
@@ -129,10 +130,10 @@ NODE_CONFIG = {
     "AppendStringsToList": {"class": AppendStringsToList, "name": "Append Strings To List"},
     "JoinStrings": {"class": JoinStrings, "name": "Join Strings"},
     "JoinStringMulti": {"class": JoinStringMulti, "name": "Join String Multi"},
+    "SimpleCalculatorKJ": {"class": SimpleCalculatorKJ, "name": "Simple Calculator KJ"},
     "SomethingToString": {"class": SomethingToString, "name": "Something To String"},
     "Sleep": {"class": Sleep, "name": "Sleep"},
     "VRAM_Debug": {"class": VRAM_Debug, "name": "VRAM Debug"},
-    "SomethingToString": {"class": SomethingToString, "name": "Something To String"},
     "EmptyLatentImagePresets": {"class": EmptyLatentImagePresets, "name": "Empty Latent Image Presets"},
     "EmptyLatentImageCustomPresets": {"class": EmptyLatentImageCustomPresets, "name": "Empty Latent Image Custom Presets"},
     "ModelPassThrough": {"class": ModelPassThrough, "name": "ModelPass"},
@@ -183,20 +184,14 @@ NODE_CONFIG = {
     "CustomControlNetWeightsFluxFromList": {"class": CustomControlNetWeightsFluxFromList, "name": "Custom ControlNet Weights Flux From List"},
     "CheckpointLoaderKJ": {"class": CheckpointLoaderKJ, "name": "CheckpointLoaderKJ"},
     "DiffusionModelLoaderKJ": {"class": DiffusionModelLoaderKJ, "name": "Diffusion Model Loader KJ"},
-    "TorchCompileModelFluxAdvanced": {"class": TorchCompileModelFluxAdvanced, "name": "TorchCompileModelFluxAdvanced"},
     "TorchCompileModelFluxAdvancedV2": {"class": TorchCompileModelFluxAdvancedV2, "name": "TorchCompileModelFluxAdvancedV2"},
-    "TorchCompileModelHyVideo": {"class": TorchCompileModelHyVideo, "name": "TorchCompileModelHyVideo"},
     "TorchCompileVAE": {"class": TorchCompileVAE, "name": "TorchCompileVAE"},
     "TorchCompileControlNet": {"class": TorchCompileControlNet, "name": "TorchCompileControlNet"},
-    "PatchModelPatcherOrder": {"class": PatchModelPatcherOrder, "name": "Patch Model Patcher Order"},
-    "TorchCompileLTXModel": {"class": TorchCompileLTXModel, "name": "TorchCompileLTXModel"},
-    "TorchCompileCosmosModel": {"class": TorchCompileCosmosModel, "name": "TorchCompileCosmosModel"},
-    "TorchCompileModelQwenImage": {"class": TorchCompileModelQwenImage, "name": "TorchCompileModelQwenImage"},
-    "TorchCompileModelWanVideo": {"class": TorchCompileModelWanVideo, "name": "TorchCompileModelWanVideo"},
     "TorchCompileModelWanVideoV2": {"class": TorchCompileModelWanVideoV2, "name": "TorchCompileModelWanVideoV2"},
     "PathchSageAttentionKJ": {"class": PathchSageAttentionKJ, "name": "Patch Sage Attention KJ"},
     "LeapfusionHunyuanI2VPatcher": {"class": LeapfusionHunyuanI2V, "name": "Leapfusion Hunyuan I2V Patcher"},
     "VAELoaderKJ": {"class": VAELoaderKJ, "name": "VAELoader KJ"},
+    "VAEDecodeLoopKJ": {"class": VAEDecodeLoopKJ, "name": "VAE Decode Loop KJ"},
     "ScheduledCFGGuidance": {"class": ScheduledCFGGuidance, "name": "Scheduled CFG Guidance"},
     "ApplyRifleXRoPE_HunuyanVideo": {"class": ApplyRifleXRoPE_HunuyanVideo, "name": "Apply RifleXRoPE HunuyanVideo"},
     "ApplyRifleXRoPE_WanVideo": {"class": ApplyRifleXRoPE_WanVideo, "name": "Apply RifleXRoPE WanVideo"},
@@ -209,6 +204,12 @@ NODE_CONFIG = {
     "ModelPatchTorchSettings": {"class": ModelPatchTorchSettings, "name": "Model Patch Torch Settings"},
     "WanVideoNAG": {"class": WanVideoNAG, "name": "WanVideoNAG"},
     "GGUFLoaderKJ": {"class": GGUFLoaderKJ, "name": "GGUF Loader KJ"},
+    "LatentInpaintTTM": {"class": LatentInpaintTTM, "name": "Latent Inpaint TTM"},
+    "NABLA_AttentionKJ": {"class": NABLA_AttentionKJ, "name": "NABLA Attention KJ"},
+    "TorchCompileModelAdvanced": {"class": TorchCompileModelAdvanced, "name": "TorchCompileModelAdvanced"},
+    "StartRecordCUDAMemoryHistory": {"class": StartRecordCUDAMemoryHistory, "name": "Start Recording CUDAMemory History"},
+    "EndRecordCUDAMemoryHistory": {"class": EndRecordCUDAMemoryHistory, "name": "End Recording CUDAMemory History"},
+    "VisualizeCUDAMemoryHistory": {"class": VisualizeCUDAMemoryHistory, "name": "Visualize CUDAMemory History"},
 
     #instance diffusion
     "CreateInstanceDiffusionTracking": {"class": CreateInstanceDiffusionTracking},
@@ -217,7 +218,20 @@ NODE_CONFIG = {
 
     #lora
     "LoraExtractKJ": {"class": LoraExtractKJ, "name": "LoraExtractKJ"},
-    "LoraReduceRankKJ": {"class": LoraReduceRank, "name": "LoraReduceRank"}
+    "LoraReduceRankKJ": {"class": LoraReduceRank, "name": "LoraReduceRank"},
+
+    #tracks
+    "GetTrackRange": {"class": GetTrackRange, "name": "Get Track Range"},
+    "AddNoiseToTrackPath": {"class": AddNoiseToTrackPath, "name": "Add Noise To Track"},
+
+    # deprecated
+    "PatchModelPatcherOrder": {"class": PatchModelPatcherOrder, "name": "Patch Model Patcher Order"},
+    "TorchCompileModelFluxAdvanced": {"class": DeprecatedCompileNodeKJ, "name": "TorchCompileModelFluxAdvanced"},
+    "TorchCompileLTXModel": {"class": DeprecatedCompileNodeKJ, "name": "TorchCompileLTXModel"},
+    "TorchCompileCosmosModel": {"class": DeprecatedCompileNodeKJ, "name": "TorchCompileCosmosModel"},
+    "TorchCompileModelHyVideo": {"class": DeprecatedCompileNodeKJ, "name": "TorchCompileModelHyVideo"},
+    "TorchCompileModelQwenImage": {"class": DeprecatedCompileNodeKJ, "name": "TorchCompileModelQwenImage"},
+    "TorchCompileModelWanVideo": {"class": DeprecatedCompileNodeKJ, "name": "TorchCompileModelWanVideo"},
 }
 
 def generate_node_mappings(node_config):

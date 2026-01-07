@@ -3,7 +3,6 @@ import time
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-import io
 import base64
 import random
 import math
@@ -12,6 +11,8 @@ import re
 import json
 import importlib
 from PIL.PngImagePlugin import PngInfo
+from io import BytesIO
+
 try:
     import cv2
 except:
@@ -20,11 +21,13 @@ except:
 from PIL import ImageGrab, ImageDraw, ImageFont, Image, ImageOps
 
 from nodes import MAX_RESOLUTION, SaveImage
-from comfy_extras.nodes_mask import ImageCompositeMasked
+from comfy_extras.nodes_mask import composite
 from comfy.cli_args import args
 from comfy.utils import ProgressBar, common_upscale
-import folder_paths
 from comfy import model_management
+import node_helpers
+import folder_paths
+
 try:
     from server import PromptServer
 except:
@@ -98,6 +101,10 @@ https://github.com/hahnec/color-matcher/
 """
     
     def colormatch(self, image_ref, image_target, method, strength=1.0, multithread=True):
+        # Skip unnecessary processing
+        if strength == 0:
+            return (image_target,)
+
         try:
             from color_matcher import ColorMatcher
         except:
@@ -118,9 +125,12 @@ https://github.com/hahnec/color-matcher/
             image_target_np_i = images_target_np if batch_size == 1 else images_target[i].numpy()
             image_ref_np_i = image_ref_np if image_ref.size(0) == 1 else images_ref[i].numpy()
             try:
-                image_result = cm.transfer(src=image_target_np_i, ref=image_ref_np_i, method=method)
-                image_result = image_target_np_i + strength * (image_result - image_target_np_i)
+                image_result = cm.transfer(src=image_target_np_i, ref=image_ref_np_i, method=method) # Avoid potential blur when only the fully color-matched image is used
+                if strength != 1:
+                    image_result = image_target_np_i + strength * (image_result - image_target_np_i)
+                    
                 return torch.from_numpy(image_result)
+                
             except Exception as e:
                 print(f"Thread {i} error: {e}")
                 return torch.from_numpy(image_target_np_i)  # fallback
@@ -169,7 +179,7 @@ Saves an image and mask as .PNG with the mask as the alpha channel.
         def file_counter():
             max_counter = 0
             # Loop through the existing files
-            for existing_file in os.listdir(full_output_folder):
+            for existing_file in sorted(os.listdir(full_output_folder)):
                 # Check if the file matches the expected format
                 match = re.fullmatch(fr"{filename}_(\d+)_?\.[a-zA-Z0-9]+", existing_file)
                 if match:
@@ -1232,7 +1242,7 @@ class ImagePrepForICLora:
                 padded_mask[:, :, :new_width] = 0
 
         return (padded_image, padded_mask)
-        
+
 
 class ImageAndMaskPreview(SaveImage):
     def __init__(self):
@@ -1246,12 +1256,12 @@ class ImageAndMaskPreview(SaveImage):
         return {
             "required": {
                 "mask_opacity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "mask_color": ("STRING", {"default": "255, 255, 255"}),
+                "mask_color": ("STRING", {"default": "255, 255, 255", "tooltip": "RGB (255,255,255) or RGBA (255,255,255,128) or Hex (#RRGGBB / #RRGGBBAA)"}),
                 "pass_through": ("BOOLEAN", {"default": False}),
              },
             "optional": {
                 "image": ("IMAGE",),
-                "mask": ("MASK",),                
+                "mask": ("MASK",),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -1265,7 +1275,7 @@ composites the mask on top of the image.
 with pass_through on the preview is disabled and the  
 composite is returned from the composite slot instead,  
 this allows for the preview to be passed for video combine  
-nodes for example.
+nodes for example. Supports RGBA for mask_color to adjust transparency per color.  
 """
 
     def execute(self, mask_opacity, mask_color, pass_through, filename_prefix="ComfyUI", image=None, mask=None, prompt=None, extra_pnginfo=None):
@@ -1277,16 +1287,35 @@ nodes for example.
             mask_adjusted = mask * mask_opacity
             mask_image = mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])).movedim(1, -1).expand(-1, -1, -1, 3).clone()
 
+            color_list = [255, 255, 255] # Default fallback
             if ',' in mask_color:
-                color_list = np.clip([int(channel) for channel in mask_color.split(',')], 0, 255) # RGB format
+                # Handle CSV format (e.g., "255, 0, 0" or "255, 0, 0, 128")
+                try:
+                    color_list = [int(channel.strip()) for channel in mask_color.split(',')]
+                except ValueError:
+                    print(f"Invalid mask_color format: {mask_color}")
             else:
+                # Handle Hex format
                 mask_color = mask_color.lstrip('#')
-                color_list = [int(mask_color[i:i+2], 16) for i in (0, 2, 4)] # Hex format
+                if len(mask_color) == 6: # #RRGGBB
+                    color_list = [int(mask_color[i:i+2], 16) for i in (0, 2, 4)]
+                elif len(mask_color) == 8: # #RRGGBBAA
+                    color_list = [int(mask_color[i:i+2], 16) for i in (0, 2, 4, 6)]
+
+            color_list = np.clip(color_list, 0, 255)
+
+            # Apply RGB channels
             mask_image[:, :, :, 0] = color_list[0] / 255 # Red channel
             mask_image[:, :, :, 1] = color_list[1] / 255 # Green channel
             mask_image[:, :, :, 2] = color_list[2] / 255 # Blue channel
-            
-            preview, = ImageCompositeMasked.composite(self, image, mask_image, 0, 0, True, mask_adjusted)
+
+            if len(color_list) == 4: # Apply Alpha channel if present
+                alpha_factor = color_list[3] / 255.0
+                mask_adjusted = mask_adjusted * alpha_factor
+
+            destination, source = node_helpers.image_alpha_fix(image, mask_image)
+            destination = destination.clone().movedim(-1, 1)
+            preview = composite(destination, source.movedim(-1, 1), 0, 0, mask_adjusted, 1, True).movedim(1, -1)
         if pass_through:
             return (preview, )
         return(self.save_images(preview, filename_prefix, prompt, extra_pnginfo))
@@ -1775,9 +1804,9 @@ Returns a range of images from a batch.
             chosen_masks = masks[start_index:end_index]
 
         return (chosen_images, chosen_masks,)
-    
+
 class ImageBatchExtendWithOverlap:
-    
+
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", )
     RETURN_NAMES = ("source_images", "start_images", "extended_images")
     OUTPUT_TOOLTIPS = (
@@ -1800,13 +1829,13 @@ Then on another copy of the node provide the newly generated frames and choose h
                 "source_images": ("IMAGE", {"tooltip": "The source images to extend"}),
                 "overlap": ("INT", {"default": 13,"min": 1, "max": 4096, "step": 1, "tooltip": "Number of overlapping frames between source and new images"}),
                 "overlap_side": (["source", "new_images"], {"default": "source", "tooltip": "Which side to overlap on"}),
-                "overlap_mode": (["cut", "linear_blend", "ease_in_out"], {"default": "linear_blend", "tooltip": "Method to use for overlapping frames"}),
+                "overlap_mode": (["cut", "linear_blend", "ease_in_out", "filmic_crossfade", "perceptual_crossfade"], {"default": "linear_blend", "tooltip": "Method to use for overlapping frames"}),
         },
         "optional": {
             "new_images": ("IMAGE", {"tooltip": "The new images to extend with"}),
         }
-    } 
-    
+    }
+
     def imagesfrombatch(self, source_images, overlap, overlap_side, overlap_mode, new_images=None):
         if overlap >= len(source_images):
             return source_images, source_images, source_images
@@ -1825,28 +1854,54 @@ Then on another copy of the node provide the newly generated frames and choose h
             suffix = new_images[overlap:]
 
             if overlap_mode == "linear_blend":
-                blended_images = [
-                    crossfade(blend_src[i], blend_dst[i], (i + 1) / (overlap + 1))
-                    for i in range(overlap)
-                ]
-                blended_images = torch.stack(blended_images, dim=0)
+                # Vectorized version - process all frames at once
+                alpha = torch.linspace(0, 1, overlap + 2, device=blend_src.device, dtype=blend_src.dtype)[1:-1]
+                alpha = alpha.view(-1, 1, 1, 1)  # Shape: [overlap, 1, 1, 1]
+                blended_images = (1 - alpha) * blend_src + alpha * blend_dst
                 extended_images = torch.cat((prefix, blended_images, suffix), dim=0)
+
+            elif overlap_mode == "filmic_crossfade":
+                gamma = 2.2
+                alpha = torch.linspace(0, 1, overlap + 2, device=blend_src.device, dtype=blend_src.dtype)[1:-1]
+                alpha = alpha.view(-1, 1, 1, 1)
+                linear_src = torch.pow(blend_src, gamma)
+                linear_dst = torch.pow(blend_dst, gamma)
+                blended = (1 - alpha) * linear_src + alpha * linear_dst
+                blended_images = torch.pow(blended, 1.0 / gamma)
+                extended_images = torch.cat((prefix, blended_images, suffix), dim=0)
+
+            elif overlap_mode == "perceptual_crossfade":
+                import kornia
+                alpha = torch.linspace(0, 1, overlap + 2, device=blend_src.device, dtype=blend_src.dtype)[1:-1]
+
+                src_nchw = blend_src.movedim(-1, 1)
+                dst_nchw = blend_dst.movedim(-1, 1)
+                lab_src = kornia.color.rgb_to_lab(src_nchw)
+                lab_dst = kornia.color.rgb_to_lab(dst_nchw)
+
+                # Blend in LAB space
+                alpha = alpha.view(-1, 1, 1, 1)  # [N,1,1,1] for broadcasting
+                blended_lab = (1 - alpha) * lab_src + alpha * lab_dst
+
+                # Convert back to RGB and reshape
+                blended_rgb = kornia.color.lab_to_rgb(blended_lab)
+                blended_images = blended_rgb.movedim(1, -1)  # [N,C,H,W] -> [N,H,W,C]
+                extended_images = torch.cat((prefix, blended_images, suffix), dim=0)
+
             elif overlap_mode == "ease_in_out":
-                blended_images = []
-                for i in range(overlap):
-                    t = (i + 1) / (overlap + 1)
-                    eased_t = ease_in_out(t)
-                    blended_image = crossfade(blend_src[i], blend_dst[i], eased_t)
-                    blended_images.append(blended_image)
-                blended_images = torch.stack(blended_images, dim=0)
+                # Vectorized ease_in_out
+                t = torch.linspace(0, 1, overlap + 2, device=blend_src.device, dtype=blend_src.dtype)[1:-1]
+                eased_t = 3 * t * t - 2 * t * t * t  # ease_in_out formula
+                eased_t = eased_t.view(-1, 1, 1, 1)
+                blended_images = (1 - eased_t) * blend_src + eased_t * blend_dst
                 extended_images = torch.cat((prefix, blended_images, suffix), dim=0)
-              
+
             elif overlap_mode == "cut":
                 extended_images = torch.cat((prefix, suffix), dim=0)
                 if overlap_side == "new_images":
-                   extended_images = torch.cat((source_images, new_images[overlap:]), dim=0)
+                    extended_images = torch.cat((source_images, new_images[overlap:]), dim=0)
                 elif overlap_side == "source":
-                   extended_images = torch.cat((source_images[:-overlap], new_images), dim=0)
+                    extended_images = torch.cat((source_images[:-overlap], new_images), dim=0)
         else:
             extended_images = torch.zeros((1, 64, 64, 3), device="cpu")
 
@@ -2826,6 +2881,7 @@ class LoadAndResizeImage:
         
         import node_helpers
         img = node_helpers.pillow(Image.open, image_path)
+        img = ImageOps.exif_transpose(img)
 
         # Process the background_color
         if background_color:
@@ -2953,7 +3009,9 @@ class LoadImagesFromFolderKJ:
 
     @classmethod
     def IS_CHANGED(cls, folder, **kwargs):
-        if not os.path.isdir(folder):
+        if folder and not os.path.isabs(folder) and args.base_directory:
+            folder = os.path.join(args.base_directory, folder)
+        if not folder or not os.path.isdir(folder):
             return float("NaN")
         
         valid_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.tga']
@@ -2971,7 +3029,7 @@ class LoadImagesFromFolderKJ:
                         except OSError:
                             pass
         else:
-            for file in os.listdir(folder):
+            for file in sorted(os.listdir(folder)):
                 if any(file.lower().endswith(ext) for ext in valid_extensions):
                     path = os.path.join(folder, file)
                     try:
@@ -3021,9 +3079,11 @@ class LoadImagesFromFolderKJ:
     CATEGORY = "KJNodes/image"
     DESCRIPTION = """Loads images from a folder into a batch, images are resized and loaded into a batch."""
 
-    def load_images(self, folder, width, height, image_load_cap, start_index, keep_aspect_ratio, include_subfolders=False):
-        if not os.path.isdir(folder):
-            raise FileNotFoundError(f"Folder '{folder} cannot be found.'")
+    def load_images(self, folder, width, height, image_load_cap, start_index, keep_aspect_ratio, include_subfolders=False):    
+        if folder and not os.path.isabs(folder) and args.base_directory:
+            folder = os.path.join(args.base_directory, folder)
+        if not folder or not os.path.isdir(folder):
+            raise FileNotFoundError(f"Folder '{folder}' cannot be found.")
         
         valid_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.tga']
         image_paths = []
@@ -3033,7 +3093,7 @@ class LoadImagesFromFolderKJ:
                     if any(file.lower().endswith(ext) for ext in valid_extensions):
                         image_paths.append(os.path.join(root, file))
         else:
-            for file in os.listdir(folder):
+            for file in sorted(os.listdir(folder)):
                 if any(file.lower().endswith(ext) for ext in valid_extensions):
                     image_paths.append(os.path.join(folder, file))
 
@@ -3172,7 +3232,6 @@ class LoadImagesFromFolderKJ:
         stat = ImageStat.Stat(edges)
         median = tuple(map(int, stat.median))
         return median
-        
 
 class ImageGridtoBatch:
     @classmethod
@@ -3183,37 +3242,38 @@ class ImageGridtoBatch:
                     "rows": ("INT", {"default": 0, "min": 1, "max": 8, "tooltip": "The number of rows in the grid. Set to 0 for automatic calculation."}),
                   }
                 }
-    
+
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "decompose"
     CATEGORY = "KJNodes/image"
     DESCRIPTION = "Converts a grid of images to a batch of images."
-        
+
     def decompose(self, image, columns, rows):
         B, H, W, C = image.shape
         print("input size: ", image.shape)
-        
+
         # Calculate cell width, rounding down
         cell_width = W // columns
-        
+
         if rows == 0:
             # If rows is 0, calculate number of full rows
+            cell_height = H // columns
             rows = H // cell_height
         else:
             # If rows is specified, adjust cell_height
             cell_height = H // rows
-        
+
         # Crop the image to fit full cells
         image = image[:, :rows*cell_height, :columns*cell_width, :]
-        
+
         # Reshape and permute the image to get the grid
         image = image.view(B, rows, cell_height, columns, cell_width, C)
         image = image.permute(0, 1, 3, 2, 4, 5).contiguous()
         image = image.view(B, rows * columns, cell_height, cell_width, C)
-        
+
         # Reshape to the final batch tensor
         img_tensor = image.view(-1, cell_height, cell_width, C)
-        
+
         return (img_tensor,)
 
 class SaveImageKJ:
@@ -3325,6 +3385,8 @@ class SaveStringKJ:
         filename_prefix += self.prefix_append
         
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
+        if output_folder and not os.path.isabs(output_folder) and args.base_directory:
+            output_folder = os.path.join(args.base_directory, output_folder)
         if output_folder != "output":
             if not os.path.exists(output_folder):
                 os.makedirs(output_folder, exist_ok=True)
@@ -3362,7 +3424,7 @@ class FastPreview:
     def preview(self, image, format, quality):        
         pil_image = to_pil_image(image[0].permute(2, 0, 1))
 
-        with io.BytesIO() as buffered:
+        with BytesIO() as buffered:
             pil_image.save(buffered, format=format, quality=quality)
             img_bytes = buffered.getvalue()
 
@@ -3950,11 +4012,14 @@ class LoadVideosFromFolder:
     FUNCTION = "load_video"
 
     def load_video(self, output_type, grid_max_columns, add_label=False, **kwargs):
+        if kwargs.get('video') and not os.path.isabs(kwargs['video']) and args.base_directory:
+            kwargs['video'] = os.path.join(args.base_directory, kwargs['video'])
+            
         if self.vhs_nodes is None:
             raise ImportError("This node requires ComfyUI-VideoHelperSuite to be installed.")
         videos_list = []
         filenames = []
-        for f in os.listdir(kwargs['video']):
+        for f in sorted(os.listdir(kwargs['video'])):
             if os.path.isfile(os.path.join(kwargs['video'], f)):
                 file_parts = f.split('.')
                 if len(file_parts) > 1 and (file_parts[-1].lower() in ['webm', 'mp4', 'mkv', 'gif', 'mov']):
