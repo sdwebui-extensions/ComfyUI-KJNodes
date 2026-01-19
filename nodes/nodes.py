@@ -2307,8 +2307,10 @@ class ImageNoiseAugmentation:
         return image_out,
 
 class VAELoaderKJ:
+    video_taes = ["taehv", "lighttaew2_2", "lighttaew2_1", "lighttaehy1_5"]
+    image_taes = ["taesd", "taesdxl", "taesd3", "taef1"]
     @staticmethod
-    def vae_list():
+    def vae_list(s):
         vaes = folder_paths.get_filename_list("vae")
         approx_vaes = folder_paths.get_filename_list("vae_approx")
         sdxl_taesd_enc = False
@@ -2337,6 +2339,11 @@ class VAELoaderKJ:
                 f1_taesd_dec = True
             elif v.startswith("taef1_decoder."):
                 f1_taesd_enc = True
+            else:
+                for tae in s.video_taes:
+                    if v.startswith(tae):
+                        vaes.append(v)
+
         if sd1_taesd_dec and sd1_taesd_enc:
             vaes.append("taesd")
         if sdxl_taesd_dec and sdxl_taesd_enc:
@@ -2345,6 +2352,7 @@ class VAELoaderKJ:
             vaes.append("taesd3")
         if f1_taesd_dec and f1_taesd_enc:
             vaes.append("taef1")
+        vaes.append("pixel_space")
         return vaes
 
     @staticmethod
@@ -2355,11 +2363,11 @@ class VAELoaderKJ:
         encoder = next(filter(lambda a: a.startswith("{}_encoder.".format(name)), approx_vaes))
         decoder = next(filter(lambda a: a.startswith("{}_decoder.".format(name)), approx_vaes))
 
-        enc = load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", encoder))
+        enc = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", encoder))
         for k in enc:
             sd["taesd_encoder.{}".format(k)] = enc[k]
 
-        dec = load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", decoder))
+        dec = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("vae_approx", decoder))
         for k in dec:
             sd["taesd_decoder.{}".format(k)] = dec[k]
 
@@ -2380,29 +2388,43 @@ class VAELoaderKJ:
     @classmethod
     def INPUT_TYPES(s):
         return {
-            "required": { "vae_name": (s.vae_list(), ),
+            "required": { "vae_name": (s.vae_list(s), ),
                           "device": (["main_device", "cpu"],),
                           "weight_dtype": (["bf16", "fp16", "fp32" ],),
                          }
             }
-        
+
     RETURN_TYPES = ("VAE",)
     FUNCTION = "load_vae"
     CATEGORY = "KJNodes/vae"
 
     def load_vae(self, vae_name, device, weight_dtype):
         from comfy.sd import VAE
+        metadata = None
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[weight_dtype]
         if device == "main_device":
             device = model_management.get_torch_device()
         elif device == "cpu":
             device = torch.device("cpu")
-        if vae_name in ["taesd", "taesdxl", "taesd3", "taef1"]:
+
+        if vae_name == "pixel_space":
+            sd = {}
+            sd["pixel_space_vae"] = torch.tensor(1.0)
+        elif vae_name in self.image_taes:
             sd = self.load_taesd(vae_name)
         else:
-            vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
-            sd = load_torch_file(vae_path)
-        vae = VAE(sd=sd, device=device, dtype=dtype)
+            if os.path.splitext(vae_name)[0] in self.video_taes:
+                vae_path = folder_paths.get_full_path_or_raise("vae_approx", vae_name)
+            else:
+                vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+            sd, metadata = comfy.utils.load_torch_file(vae_path, return_metadata=True)
+
+        if "vocoder.conv_post.weight" in sd:
+            from comfy.ldm.lightricks.vae.audio_vae import AudioVAE
+            vae = AudioVAE(sd, metadata)
+        else:
+            vae = VAE(sd=sd, device=device, dtype=dtype, metadata=metadata)
+            vae.throw_exception_if_invalid()
         return (vae,)
 
 from comfy.samplers import sampling_function, CFGGuider
@@ -2444,7 +2466,7 @@ class Guider_ScheduledCFG(CFGGuider):
             cfg = 1.0
 
         return sampling_function(self.inner_model, x, timestep, uncond, self.conds.get("positive", None), cfg, model_options=model_options, seed=seed)            
-  
+
 class ScheduledCFGGuidance:
     @classmethod
     def INPUT_TYPES(s):
@@ -2470,7 +2492,7 @@ cfg input can be a list of floats matching step count, or a single float for all
         guider.set_conds(positive, negative)
         guider.set_cfg(cfg, start_percent, end_percent)
         return (guider, )
-    
+
 
 class ApplyRifleXRoPE_WanVideo:
     @classmethod
@@ -2721,24 +2743,26 @@ class LazySwitchKJ:
 
 from comfy.patcher_extension import WrappersMP
 from comfy.sampler_helpers import prepare_mask
-class TTM_SampleWrapper:
+class TTM_OuterSampleWrapper:
     def __init__(self, mask, steps):
         self.mask = mask
         self.steps = steps
 
-    def __call__(self, sampler, guider, sigmas, extra_args, callback, noise, latent_image, denoise_mask, disable_pbar):
-        model_options = extra_args["model_options"]
-        wrappers = model_options["transformer_options"]["wrappers"]
+    def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes):
+        guider = executor.class_obj
+        guider.model_options
+        wrappers = guider.model_options["transformer_options"]["wrappers"]
         w = wrappers.setdefault(WrappersMP.APPLY_MODEL, {})
 
         if self.mask is not None:
             motion_mask = self.mask.reshape((-1, 1, self.mask.shape[-2], self.mask.shape[-1]))
-            motion_mask = prepare_mask(motion_mask, noise.shape, noise.device)
+            shape = latent_shapes[0]
+            motion_mask = prepare_mask(motion_mask, shape, noise.device)
 
         scale_latent_inpaint = guider.model_patcher.model.scale_latent_inpaint
         w["TTM_ApplyModel_Wrapper"] = [TTM_ApplyModel_Wrapper(latent_image, noise, motion_mask, self.steps, scale_latent_inpaint)]
 
-        out = sampler(guider, sigmas, extra_args, callback, noise, latent_image, denoise_mask, disable_pbar)
+        out = executor(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=latent_shapes)
 
         return out
 
@@ -2792,7 +2816,7 @@ class LatentInpaintTTM:
 
     def patch(self, model, steps, mask=None):
         m = model.clone()
-        m.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, "TTM_SampleWrapper", TTM_SampleWrapper(mask, steps))
+        m.add_wrapper_with_key(WrappersMP.OUTER_SAMPLE, "TTM_OuterSampleWrapper", TTM_OuterSampleWrapper(mask, steps))
         return (m, )
 
 
@@ -3077,3 +3101,137 @@ class DeprecatedCompileNodeKJ:
     DESCRIPTION = "This node has been replaced with TorchCompileModelAdvanced node, please use that instead."
     def passthrough(self, model):
         return (model,)
+
+
+class VisualizeSigmasKJ(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="VisualizeSigmasKJ",
+            category="KJNodes/misc",
+            inputs=[
+                io.Sigmas.Input("sigmas"),
+                io.Int.Input("start_step", default=0, min=-1, max=1000, step=1,
+                             tooltip="Step index to mark as the start of a range (inclusive). Set to -1 to disable."),
+                io.Int.Input("end_step", default=-1, min=-1, max=1000, step=1,
+                             tooltip="Step index to mark as the end of a range (inclusive). Set to - 1 to disable."),
+            ],
+            outputs=[
+                io.Sigmas.Output(display_name="sigmas_out"),
+                io.Image.Output(display_name="image"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, sigmas, start_step=0, end_step=-1) -> io.NodeOutput:
+
+        start_idx = 0
+        end_idx = len(sigmas) - 1
+
+        if isinstance(start_step, float):
+            idxs = (sigmas <= start_step).nonzero(as_tuple=True)[0]
+            if len(idxs) > 0:
+                start_idx = idxs[0].item()
+        elif isinstance(start_step, int):
+            if start_step > 0:
+                start_idx = start_step
+
+        if isinstance(end_step, float):
+            idxs = (sigmas >= end_step).nonzero(as_tuple=True)[0]
+            if len(idxs) > 0:
+                end_idx = idxs[-1].item()
+        elif isinstance(end_step, int):
+            if end_step != -1:
+                end_idx = end_step - 1
+
+        import matplotlib.pyplot as plt
+        sigmas_np = sigmas.cpu().numpy()
+        if not np.isclose(sigmas_np[-1], 0.0, atol=1e-6):
+            sigmas_np = np.append(sigmas_np, 0.0)
+        buf = BytesIO()
+        fig = plt.figure(facecolor='#353535')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('#353535')  # Set axes background color
+        x_values = range(0, len(sigmas_np))
+        ax.plot(x_values, sigmas_np)
+        # Annotate each sigma value
+        ax.scatter(x_values, sigmas_np, color='white', s=20, zorder=3)  # Small dots at each sigma
+        for x, y in zip(x_values, sigmas_np):
+            # Show all annotations if few steps, or just show split step annotations
+            show_annotation = len(sigmas_np) <= 10
+            is_split_step = (start_idx > 0 and x == start_idx) or (end_idx != -1 and x == end_idx + 1)
+
+            if show_annotation or is_split_step:
+                color = 'orange'
+                if is_split_step:
+                    color = 'yellow'
+                ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points", xytext=(10, 1), ha='center', color=color, fontsize=12)
+        ax.set_xticks(x_values)
+        ax.set_title("Sigmas", color='white')           # Title font color
+        ax.set_xlabel("Step", color='white')            # X label font color
+        ax.set_ylabel("Sigma Value", color='white')     # Y label font color
+        ax.tick_params(axis='x', colors='white', labelsize=10)        # X tick color
+        ax.tick_params(axis='y', colors='white', labelsize=10)        # Y tick color
+        # Add split point if end_step is defined
+        end_idx += 1
+        if end_idx != -1 and 0 <= end_idx < len(sigmas_np) - 1:
+            ax.axvline(end_idx, color='red', linestyle='--', linewidth=2, label='end_step split')
+        # Add split point if start_step is defined
+        if start_idx > 0 and 0 <= start_idx < len(sigmas_np):
+            ax.axvline(start_idx, color='green', linestyle='--', linewidth=2, label='start_step split')
+        if (end_idx != -1 and 0 <= end_idx < len(sigmas_np)) or (start_idx > 0 and 0 <= start_idx < len(sigmas_np)):
+            handles, labels = ax.get_legend_handles_labels()
+            if labels:
+                ax.legend()
+        # Draw shaded range
+        range_start_idx = start_idx if start_idx > 0 else 0
+        range_end_idx = end_idx if end_idx > 0 and end_idx < len(sigmas_np) else len(sigmas_np) - 1
+        if range_start_idx < range_end_idx:
+            ax.axvspan(range_start_idx, range_end_idx, color='lightblue', alpha=0.1, label='Sampled Range')
+
+
+        plt.tight_layout()
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        try:
+            buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+            buf = buf.reshape(h, w, 4)
+            buf = buf[:, :, [1, 2, 3]]  # Convert ARGB to RGB
+        except:
+            buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            buf = buf.reshape(h, w, 3).copy()
+        image = torch.from_numpy(buf).float() / 255.0
+        image = image.unsqueeze(0) #(H, W, C) -> (1, H, W, C)
+        plt.close(fig)
+
+        sigmas_out = sigmas[start_idx:end_idx + 1] if end_idx != -1 else sigmas[start_idx:]
+
+        return io.NodeOutput(sigmas_out,image)
+
+class PreviewLatentNoiseMask(io.ComfyNode):
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PreviewLatentNoiseMask",
+            category="KJNodes/latent",
+            description="Previews the latent noise mask",
+            inputs=[
+                io.Latent.Input("latent",),
+            ],
+            outputs=[
+                io.Mask.Output(display_name="mask"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, latent) -> io.NodeOutput:
+        noise_mask = latent.get("noise_mask", None)
+        if noise_mask is None:
+            return io.NodeOutput(torch.zeros((1, 64, 64)))
+        noise_mask = noise_mask.clone()
+
+        if noise_mask.ndim == 5:
+            noise_mask = noise_mask[0, 0]
+
+        return io.NodeOutput(noise_mask)

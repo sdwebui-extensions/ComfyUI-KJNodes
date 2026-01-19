@@ -7,6 +7,8 @@ from .nodes.intrinsic_lora_nodes import *
 from .nodes.mask_nodes import *
 from .nodes.model_optimization_nodes import *
 from .nodes.lora_nodes import *
+
+
 NODE_CONFIG = {
     #constants
     "BOOLConstant": {"class": BOOLConstant, "name": "BOOL Constant"},
@@ -142,6 +144,7 @@ NODE_CONFIG = {
     "StyleModelApplyAdvanced": {"class": StyleModelApplyAdvanced, "name": "Style Model Apply Advanced"},
     "DiffusionModelSelector": {"class": DiffusionModelSelector, "name": "Diffusion Model Selector"},
     "LazySwitchKJ": {"class": LazySwitchKJ, "name": "Lazy Switch KJ"},
+    "VisualizeSigmasKJ": {"class": VisualizeSigmasKJ, "name": "Visualize Sigmas KJ"},
     #audioscheduler stuff
     "NormalizedAmplitudeToMask": {"class": NormalizedAmplitudeToMask},
     "NormalizedAmplitudeToFloatList": {"class": NormalizedAmplitudeToFloatList},
@@ -210,6 +213,7 @@ NODE_CONFIG = {
     "StartRecordCUDAMemoryHistory": {"class": StartRecordCUDAMemoryHistory, "name": "Start Recording CUDAMemory History"},
     "EndRecordCUDAMemoryHistory": {"class": EndRecordCUDAMemoryHistory, "name": "End Recording CUDAMemory History"},
     "VisualizeCUDAMemoryHistory": {"class": VisualizeCUDAMemoryHistory, "name": "Visualize CUDAMemory History"},
+    "PreviewLatentNoiseMask": {"class": PreviewLatentNoiseMask, "name": "Preview Latent Noise Mask"},
 
     #instance diffusion
     "CreateInstanceDiffusionTracking": {"class": CreateInstanceDiffusionTracking},
@@ -233,6 +237,23 @@ NODE_CONFIG = {
     "TorchCompileModelQwenImage": {"class": DeprecatedCompileNodeKJ, "name": "TorchCompileModelQwenImage"},
     "TorchCompileModelWanVideo": {"class": DeprecatedCompileNodeKJ, "name": "TorchCompileModelWanVideo"},
 }
+
+#ltxv
+try:
+    from .nodes.ltxv_nodes import *
+    NODE_CONFIG.update({
+    "LTXVEnhanceAVideoKJ": {"class": LTXVEnhanceAVideoKJ, "name": "LTXV Enhance A Video KJ"},
+    "LTXVAddGuideMulti": {"class": LTXVAddGuideMulti, "name": "LTXV Add Guide Multi"},
+    "LTXVAddGuidesFromBatch": {"class": LTXVAddGuidesFromBatch, "name": "LTXV Add Guides From Batch"},
+    "LTXVAudioVideoMask": {"class": LTXVAudioVideoMask, "name": "LTXV Audio Video Mask"},
+    "LTX2_NAG": {"class": LTX2_NAG, "name": "LTX2 NAG"},
+    "LTXVChunkFeedForward": {"class": LTXVChunkFeedForward, "name": "LTXV Chunk Feed Forward"},
+    "LTX2SamplingPreviewOverride": {"class": LTX2SamplingPreviewOverride, "name": "LTX2 Sampling Preview Override"},
+    "LTX2AudioLatentNormalizingSampling": {"class": LTX2AudioLatentNormalizingSampling, "name": "LTX2 Audio Latent Normalizing Sampling"},
+    "LTXVImgToVideoInplaceKJ": {"class": LTXVImgToVideoInplaceKJ, "name": "LTXV Img To Video Inplace KJ"},
+    })
+except ImportError:
+    pass
 
 def generate_node_mappings(node_config):
     node_class_mappings = {}
