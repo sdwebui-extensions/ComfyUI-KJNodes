@@ -51,6 +51,7 @@ NODE_CONFIG = {
     #images
     "AddLabel": {"class": AddLabel, "name": "Add Label"},
     "ColorMatch": {"class": ColorMatch, "name": "Color Match"},
+    "ColorMatchV2": {"class": ColorMatchV2, "name": "Color Match V2"},
     "ImageTensorList": {"class": ImageTensorList, "name": "Image Tensor List"},
     "CrossFadeImages": {"class": CrossFadeImages, "name": "Cross Fade Images"},
     "CrossFadeImagesMulti": {"class": CrossFadeImagesMulti, "name": "Cross Fade Images Multi"},
@@ -184,6 +185,7 @@ NODE_CONFIG = {
     "FluxBlockLoraSelect": {"class": FluxBlockLoraSelect, "name": "Flux Block Lora Select"},
     "HunyuanVideoBlockLoraSelect": {"class": HunyuanVideoBlockLoraSelect, "name": "Hunyuan Video Block Lora Select"},
     "Wan21BlockLoraSelect": {"class": Wan21BlockLoraSelect, "name": "Wan21 Block Lora Select"},
+    "LTX2BlockLoraSelect": {"class": LTX2BlockLoraSelect, "name": "LTX2 Block Lora Select"},
     "CustomControlNetWeightsFluxFromList": {"class": CustomControlNetWeightsFluxFromList, "name": "Custom ControlNet Weights Flux From List"},
     "CheckpointLoaderKJ": {"class": CheckpointLoaderKJ, "name": "CheckpointLoaderKJ"},
     "DiffusionModelLoaderKJ": {"class": DiffusionModelLoaderKJ, "name": "Diffusion Model Loader KJ"},
@@ -215,6 +217,9 @@ NODE_CONFIG = {
     "VisualizeCUDAMemoryHistory": {"class": VisualizeCUDAMemoryHistory, "name": "Visualize CUDAMemory History"},
     "PreviewLatentNoiseMask": {"class": PreviewLatentNoiseMask, "name": "Preview Latent Noise Mask"},
     "ModelMemoryUseReportPatch": {"class": ModelMemoryUseReportPatch, "name": "Model Memory Use Report Patch"},
+    "ModelMemoryUsageFactorOverride": {"class": ModelMemoryUsageFactorOverride, "name": "Model Memory Usage Factor Override"},
+    "WanChunkFeedForward": {"class": WanChunkFeedForward, "name": "Wan ChunkFeedForward"},
+    "SamplerSelfRefineVideo": {"class": SamplerSelfRefineVideo, "name": "Sampler SelfRefineVideo"},
 
     #instance diffusion
     "CreateInstanceDiffusionTracking": {"class": CreateInstanceDiffusionTracking},
@@ -253,9 +258,11 @@ try:
     "LTX2AudioLatentNormalizingSampling": {"class": LTX2AudioLatentNormalizingSampling, "name": "LTX2 Audio Latent Normalizing Sampling"},
     "LTXVImgToVideoInplaceKJ": {"class": LTXVImgToVideoInplaceKJ, "name": "LTXV Img To Video Inplace KJ"},
     "LTX2AttentionTunerPatch": {"class": LTX2AttentionTunerPatch, "name": "LTX2 Attention Tuner Patch"},
+    "LTX2MemoryEfficientSageAttentionPatch": {"class": LTX2MemoryEfficientSageAttentionPatch, "name": "LTX2 Memory Efficient Sage Attention Patch"},
+    "LTX2LoraLoaderAdvanced": {"class": LTX2LoraLoaderAdvanced, "name": "LTX2 Lora Loader Advanced"},
     })
-except ImportError:
-    pass
+except Exception as e:
+    logging.warning(f"KJNodes: LTXV nodes could not be imported. LTXV nodes will be unavailable. Error: {e}")
 
 def generate_node_mappings(node_config):
     node_class_mappings = {}

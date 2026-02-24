@@ -10,6 +10,7 @@ import os
 import re
 import json
 import importlib
+import logging
 from PIL.PngImagePlugin import PngInfo
 from io import BytesIO
 
@@ -25,6 +26,7 @@ from comfy_extras.nodes_mask import composite
 from comfy.cli_args import args
 from comfy.utils import ProgressBar, common_upscale
 from comfy import model_management
+from comfy_api.latest import io
 import node_helpers
 import folder_paths
 
@@ -147,7 +149,112 @@ https://github.com/hahnec/color-matcher/
         out = torch.stack(out, dim=0).to(torch.float32)
         out.clamp_(0, 1)
         return (out,)
-    
+
+class ColorMatchV2(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="ColorMatchV2",
+            category="KJNodes/image",
+            description="""
+color-matcher enables color transfer across images which comes in handy for automatic  
+color-grading of photographs, paintings and film sequences as well as light-field  
+and stopmotion corrections.  
+
+The methods behind the mappings are based on the approach from Reinhard et al.,  
+the Monge-Kantorovich Linearization (MKL) as proposed by Pitie et al. and our analytical solution  
+to a Multi-Variate Gaussian Distribution (MVGD) transfer in conjunction with classical histogram   
+matching. As shown below our HM-MVGD-HM compound outperforms existing methods.   
+https://github.com/hahnec/color-matcher/   
+
+'reinhard_lab_gpu' method uses Kornia for GPU-accelerated color transfer in Lab color space.
+""",
+            inputs=[
+                io.Image.Input("image_target"),
+                io.Image.Input("image_ref"),
+                io.Combo.Input("method", 
+                    options=['mkl', 'hm', 'reinhard', 'mvgd', 'hm-mvgd-hm', 'hm-mkl-hm', 'reinhard_lab_gpu'],
+                    default='mkl'),
+                io.Float.Input("strength", default=1.0, min=0.0, max=10.0, step=0.01),
+                io.Boolean.Input("multithread", default=True),
+            ],
+            outputs=[
+                io.Image.Output(display_name="image"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, image_target, image_ref, method, strength=1.0, multithread=True) -> io.NodeOutput:
+        # Skip unnecessary processing
+        if strength == 0:
+            return io.NodeOutput(image_target)
+
+        if method == "reinhard_lab_gpu":
+            import kornia
+            device = model_management.get_torch_device()
+
+            B, H, W, C = image_target.shape
+
+            src_bchw = image_target.to(device).permute(0, 3, 1, 2).contiguous() # (B, H, W, C) -> (B, C, H, W)
+            ref_bchw = image_ref.to(device).permute(0, 3, 1, 2).contiguous()
+            # RGB->Lab
+            src_lab = kornia.color.rgb_to_lab(src_bchw)
+            ref_lab = kornia.color.rgb_to_lab(ref_bchw)
+
+            src_lab_flat = src_lab.view(B, C, -1)  # (B, C, HW)
+            ref_lab_flat = ref_lab.view(ref_lab.shape[0], C, -1)  # (B or 1, C, HW)
+
+            src_std, src_mean = torch.std_mean(src_lab_flat, dim=-1, keepdim=True, unbiased=False)
+            ref_std, ref_mean = torch.std_mean(ref_lab_flat, dim=-1, keepdim=True, unbiased=False)
+            src_std = src_std.clamp_min_(1e-6)
+
+            if ref_lab.shape[0] == 1 and B > 1:
+                ref_mean = ref_mean.expand(B, -1, -1)
+                ref_std = ref_std.expand(B, -1, -1)
+
+            corrected_lab_flat = (src_lab_flat - src_mean) * (ref_std / src_std) + ref_mean
+            corrected_lab = corrected_lab_flat.view(B, C, H, W)
+
+            # Lab->RGB
+            corrected_rgb_01 = kornia.color.lab_to_rgb(corrected_lab)
+            out = (1.0 - strength) * src_bchw + strength * corrected_rgb_01
+            out = out.permute(0, 2, 3, 1).contiguous() # (B, C, H, W) -> (B, H, W, C)
+
+            return io.NodeOutput(out.cpu().float().clamp_(0, 1))
+
+        try:
+            from color_matcher import ColorMatcher
+        except:
+            raise Exception("Can't import color-matcher, did you install requirements.txt? Manual install: pip install color-matcher")
+
+        batch_size = image_target.size(0)
+        ref_batch_size = image_ref.size(0)
+
+        def process(i):
+            cm = ColorMatcher()
+            image_target_np = image_target[i].cpu().numpy()
+            image_ref_np = image_ref[min(i, ref_batch_size - 1)].cpu().numpy()
+            try:
+                image_result = cm.transfer(src=image_target_np, ref=image_ref_np, method=method)
+                if strength != 1:
+                    image_result = image_target_np + strength * (image_result - image_target_np)
+
+                return torch.from_numpy(image_result)
+
+            except Exception as e:
+                logging.error(f"Thread {i} error: {e}")
+                return torch.from_numpy(image_target_np)  # fallback
+        if multithread and batch_size > 1:
+            max_threads = min(os.cpu_count() or 1, batch_size)
+            with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                out = list(executor.map(process, range(batch_size)))
+        else:
+            out = [process(i) for i in range(batch_size)]
+
+        out = torch.stack(out, dim=0).to(torch.float32).clamp_(0, 1)
+
+        return io.NodeOutput(out)
+
 class SaveImageWithAlpha:
     def __init__(self):
         self.output_dir = folder_paths.get_output_directory()
@@ -176,8 +283,6 @@ Saves an image and mask as .PNG with the mask as the alpha channel.
         filename_prefix += self.prefix_append
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
         results = list()
-        if mask.dtype == torch.float16:
-            mask = mask.to(torch.float32)
         def file_counter():
             max_counter = 0
             # Loop through the existing files
@@ -194,9 +299,9 @@ Saves an image and mask as .PNG with the mask as the alpha channel.
 
         for image, alpha in zip(images, mask):
             i = 255. * image.cpu().numpy()
-            a = 255. * alpha.cpu().numpy()
+            a = 255. * (1.0 - alpha.cpu().float()).numpy()
             img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-            
+
              # Resize the mask to match the image size
             a_resized = Image.fromarray(a).resize(img.size, Image.LANCZOS)
             a_resized = np.clip(a_resized, 0, 255).astype(np.uint8)
@@ -209,7 +314,7 @@ Saves an image and mask as .PNG with the mask as the alpha channel.
                 if extra_pnginfo is not None:
                     for x in extra_pnginfo:
                         metadata.add_text(x, json.dumps(extra_pnginfo[x]))
-           
+
             # Increment the counter by 1 to get the next available value
             counter = file_counter() + 1
             file = f"{filename}_{counter:05}.png"
@@ -832,7 +937,7 @@ class GetLatentSizeAndCount:
         }}
 
     RETURN_TYPES = ("LATENT","INT", "INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("latent", "batch_size", "channels", "frames", "width", "height")
+    RETURN_NAMES = ("latent", "batch_size", "channels", "frames", "height", "width")
     FUNCTION = "getsize"
     CATEGORY = "KJNodes/image"
     DESCRIPTION = """
@@ -892,31 +997,37 @@ with repeats 2 becomes batch of 10 images: 0, 0, 1, 1, 2, 2, 3, 3, 4, 4
 
         print("mask shape", mask.shape)
         return (repeated_images, mask)
-    
+
 class ImageUpscaleWithModelBatched:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "upscale_model": ("UPSCALE_MODEL",),
                               "images": ("IMAGE",),
                               "per_batch": ("INT", {"default": 16, "min": 1, "max": 4096, "step": 1}),
-                              }}
+                              },
+                "optional": {
+                    "downscale_ratio": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01}),
+                    "downscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], {"default": "lanczos"}),
+                    "precision": (["float32", "float16", "bfloat16"], {"default": "float32"}),
+                }}
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "upscale"
     CATEGORY = "KJNodes/image"
     DESCRIPTION = """
 Same as ComfyUI native model upscaling node,  
 but allows setting sub-batches for reduced VRAM usage.
+Optionally downscale the result with a ratio.
 """
-    def upscale(self, upscale_model, images, per_batch):
-        
+    def upscale(self, upscale_model, images, per_batch, downscale_ratio=1.0, downscale_method="lanczos", precision="float32"):
+        dtype = torch.float16 if precision == "float16" else torch.bfloat16 if precision == "bfloat16" else torch.float32
         device = model_management.get_torch_device()
-        upscale_model.to(device)
-        in_img = images.movedim(-1,-3)
-        
+        upscale_model.to(device, dtype=dtype)
+        in_img = images.movedim(-1,-3).to(dtype)
+
         steps = in_img.shape[0]
         pbar = ProgressBar(steps)
         t = []
-        
+
         for start_idx in range(0, in_img.shape[0], per_batch):
             sub_images = upscale_model(in_img[start_idx:start_idx+per_batch].to(device))
             t.append(sub_images.cpu())
@@ -925,8 +1036,18 @@ but allows setting sub-batches for reduced VRAM usage.
             # Update the progress bar by the number of images processed in this batch
             pbar.update(batch_count)
         upscale_model.cpu()
-        
-        t = torch.cat(t, dim=0).permute(0, 2, 3, 1).cpu()
+
+        t = torch.cat(t, dim=0).permute(0, 2, 3, 1).cpu().float()
+
+        # Apply downscaling if ratio is less than 1.0
+        if downscale_ratio < 1.0:
+            original_height = t.shape[1]
+            original_width = t.shape[2]
+            new_height = int(original_height * downscale_ratio)
+            new_width = int(original_width * downscale_ratio)
+            t = t.movedim(-1, 1)
+            t = common_upscale(t, new_width, new_height, downscale_method, "disabled")
+            t = t.movedim(1, -1)
 
         return (t,)
 
@@ -3343,7 +3464,7 @@ class SaveImageKJ:
             if caption is not None:
                 txt_file = base_file_name + caption_file_extension
                 file_path = os.path.join(full_output_folder, txt_file)
-                with open(file_path, 'w') as f:
+                with open(file_path, "w", encoding="utf-8") as f:
                     f.write(caption)
 
             counter += 1
@@ -3381,7 +3502,7 @@ class SaveStringKJ:
 
     def save_string(self, string, output_folder, filename_prefix="text", file_extension=".txt"):
         filename_prefix += self.prefix_append
-        
+
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir)
         if output_folder and not os.path.isabs(output_folder) and args.base_directory:
             output_folder = os.path.join(args.base_directory, output_folder)
@@ -3395,7 +3516,7 @@ class SaveStringKJ:
 
         txt_file = base_file_name + file_extension
         file_path = os.path.join(full_output_folder, txt_file)
-        with open(file_path, 'w') as f:
+        with open(file_path, 'w', encoding="utf-8") as f:
             f.write(string)
 
         return results,
@@ -3444,7 +3565,6 @@ class ImageCropByMaskAndResize:
                 "padding": ("INT", { "default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1, }),
                 "min_crop_resolution": ("INT", { "default": 128, "min": 0, "max": MAX_RESOLUTION, "step": 8, }),
                 "max_crop_resolution": ("INT", { "default": 512, "min": 0, "max": MAX_RESOLUTION, "step": 8, }),
-           
             },
         }
 
@@ -3454,9 +3574,14 @@ class ImageCropByMaskAndResize:
     CATEGORY = "KJNodes/image"
 
     def crop_by_mask(self, mask, padding=0, min_crop_resolution=None, max_crop_resolution=None):
+        """
+        Calculate bounding box from mask with proper padding boundary protection
+        Ensures crop region never exceeds original image boundaries
+        """
         iy, ix = (mask == 1).nonzero(as_tuple=True)
         h0, w0 = mask.shape
 
+        # Handle empty mask
         if iy.numel() == 0:
             x_c = w0 / 2.0
             y_c = h0 / 2.0
@@ -3467,51 +3592,49 @@ class ImageCropByMaskAndResize:
             x_max = ix.max().item()
             y_min = iy.min().item()
             y_max = iy.max().item()
-
-            width = x_max - x_min
-            height = y_max - y_min
-
-            if width > w0 or height > h0:
-                raise Exception("Masked area out of bounds")
-
+            width = x_max - x_min + 1  # Include boundary pixels
+            height = y_max - y_min + 1
             x_c = (x_min + x_max) / 2.0
             y_c = (y_min + y_max) / 2.0
 
+        # Apply min/max resolution constraints
         if min_crop_resolution:
             width = max(width, min_crop_resolution)
             height = max(height, min_crop_resolution)
-
         if max_crop_resolution:
             width = min(width, max_crop_resolution)
             height = min(height, max_crop_resolution)
 
-        if w0 <= width:
-            x0 = 0
-            w = w0
-        else:
-            x0 = max(0, x_c - width / 2 - padding)
-            w = width + 2 * padding
-            if x0 + w > w0:
-                x0 = w0 - w
+        # Critical: Limit padding expansion to available image space
+        # Calculate maximum possible padding for each direction
+        max_padding_x = min((w0 - width) // 2, padding)
+        max_padding_y = min((h0 - height) // 2, padding)
+        
+        # Apply constrained padding
+        final_width = width + 2 * max_padding_x
+        final_height = height + 2 * max_padding_y
 
-        if h0 <= height:
-            y0 = 0
-            h = h0
-        else:
-            y0 = max(0, y_c - height / 2 - padding)
-            h = height + 2 * padding
-            if y0 + h > h0:
-                y0 = h0 - h
+        # Ensure final dimensions don't exceed image bounds
+        final_width = min(final_width, w0)
+        final_height = min(final_height, h0)
 
-        return (int(x0), int(y0), int(w), int(h))
+        # Calculate top-left corner with boundary protection
+        # Center the crop while respecting image boundaries
+        x0 = max(0, min(int(x_c - final_width / 2), w0 - final_width))
+        y0 = max(0, min(int(y_c - final_height / 2), h0 - final_height))
+
+        return (x0, y0, final_width, final_height)
 
     def crop(self, image, mask, base_resolution, padding=0, min_crop_resolution=128, max_crop_resolution=512):
+        """
+        Main crop and resize function with uniform target dimensions for all batch items
+        """
         mask = mask.round()
         image_list = []
         mask_list = []
         bbox_list = []
 
-        # First, collect all bounding boxes
+        # Step 1: Calculate individual bounding boxes
         bbox_params = []
         aspect_ratios = []
         for i in range(image.shape[0]):
@@ -3519,15 +3642,16 @@ class ImageCropByMaskAndResize:
             bbox_params.append((x0, y0, w, h))
             aspect_ratios.append(w / h)
 
-        # Find maximum width and height
+        # Step 2: Calculate uniform target dimensions based on maximum aspect ratio
         max_w = max([w for x0, y0, w, h in bbox_params])
         max_h = max([h for x0, y0, w, h in bbox_params])
         max_aspect_ratio = max(aspect_ratios)
 
-        # Ensure dimensions are divisible by 16
+        # Round up to nearest multiple of 16 for stable processing
         max_w = (max_w + 15) // 16 * 16
         max_h = (max_h + 15) // 16 * 16
-        # Calculate common target dimensions
+
+        # Determine target dimensions maintaining aspect ratio
         if max_aspect_ratio > 1:
             target_width = base_resolution
             target_height = int(base_resolution / max_aspect_ratio)
@@ -3535,31 +3659,36 @@ class ImageCropByMaskAndResize:
             target_height = base_resolution
             target_width = int(base_resolution * max_aspect_ratio)
 
+        # Ensure target dimensions are multiples of 16
+        target_width = (target_width + 15) // 16 * 16
+        target_height = (target_height + 15) // 16 * 16
+
+        # Step 3: Process each image with uniform crop size
         for i in range(image.shape[0]):
-            x0, y0, w, h = bbox_params[i]
+            orig_x0, orig_y0, orig_w, orig_h = bbox_params[i]
+            
+            # Calculate center of original bounding box
+            x_center = orig_x0 + orig_w / 2
+            y_center = orig_y0 + orig_h / 2
 
-            # Adjust cropping to use maximum width and height
-            x_center = x0 + w / 2
-            y_center = y0 + h / 2
+            # Define uniform crop region centered on each image's bounding box
+            # This ensures all crops have exactly the same dimensions
+            x0_new = max(0, min(int(x_center - max_w / 2), image.shape[2] - max_w))
+            y0_new = max(0, min(int(y_center - max_h / 2), image.shape[1] - max_h))
+            x1_new = x0_new + max_w
+            y1_new = y0_new + max_h
 
-            x0_new = int(max(0, x_center - max_w / 2))
-            y0_new = int(max(0, y_center - max_h / 2))
-            x1_new = int(min(x0_new + max_w, image.shape[2]))
-            y1_new = int(min(y0_new + max_h, image.shape[1]))
-            x0_new = x1_new - max_w
-            y0_new = y1_new - max_h
-
+            # Extract cropped regions
             cropped_image = image[i][y0_new:y1_new, x0_new:x1_new, :]
             cropped_mask = mask[i][y0_new:y1_new, x0_new:x1_new]
-            
-            # Ensure dimensions are divisible by 16
-            target_width = (target_width + 15) // 16 * 16
-            target_height = (target_height + 15) // 16 * 16
 
-            cropped_image = cropped_image.unsqueeze(0).movedim(-1, 1)  # Move C to the second position (B, C, H, W)
+            # Resize to exact target dimensions
+            # Image with lanczos interpolation
+            cropped_image = cropped_image.unsqueeze(0).movedim(-1, 1)
             cropped_image = common_upscale(cropped_image, target_width, target_height, "lanczos", "disabled")
             cropped_image = cropped_image.movedim(1, -1).squeeze(0)
 
+            # Mask with bilinear interpolation
             cropped_mask = cropped_mask.unsqueeze(0).unsqueeze(0)
             cropped_mask = common_upscale(cropped_mask, target_width, target_height, 'bilinear', "disabled")
             cropped_mask = cropped_mask.squeeze(0).squeeze(0)
@@ -3567,7 +3696,6 @@ class ImageCropByMaskAndResize:
             image_list.append(cropped_image)
             mask_list.append(cropped_mask)
             bbox_list.append((x0_new, y0_new, x1_new, y1_new))
-
 
         return (torch.stack(image_list), torch.stack(mask_list), bbox_list)
     
