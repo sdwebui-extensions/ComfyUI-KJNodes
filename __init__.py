@@ -107,6 +107,9 @@ NODE_CONFIG = {
     "SplitImageChannels": {"class": SplitImageChannels, "name": "Split Image Channels"},
     "TransitionImagesMulti": {"class": TransitionImagesMulti, "name": "Transition Images Multi"},
     "TransitionImagesInBatch": {"class": TransitionImagesInBatch, "name": "Transition Images In Batch"},
+    "EncodeVideoComponents": {"class": EncodeVideoComponents, "name": "Encode Video Components"},
+    "DecodeAndSaveVideo": {"class": DecodeAndSaveVideo, "name": "Decode And Save Video"},
+    "PreviewImageOrMask": {"class": PreviewImageOrMask, "name": "Preview Image Or Mask"},
     #batch cropping
     "BatchCropFromMask": {"class": BatchCropFromMask, "name": "Batch Crop From Mask"},
     "BatchCropFromMaskAdvanced": {"class": BatchCropFromMaskAdvanced, "name": "Batch Crop From Mask Advanced"},

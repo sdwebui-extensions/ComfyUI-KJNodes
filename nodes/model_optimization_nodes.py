@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import torch
 import importlib
@@ -9,7 +10,7 @@ from tqdm import tqdm
 import folder_paths
 import comfy.model_management as mm
 from comfy.cli_args import args
-from comfy.ldm.modules.attention import wrap_attn, optimized_attention
+from comfy.ldm.modules.attention import wrap_attn, optimized_attention, attention_pytorch
 import comfy.utils
 import comfy.sd
 
@@ -56,6 +57,8 @@ def get_sage_func(sage_attention, allow_compile=False):
 
     @wrap_attn
     def attention_sage(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+        if kwargs.get("low_precision_attention", True) is False:
+            return attention_pytorch(q, k, v, heads, mask=mask, skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
         in_dtype = v.dtype
         if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
             q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
@@ -143,7 +146,7 @@ class CheckpointLoaderKJ():
     FUNCTION = "load"
     DESCRIPTION = "Experimental node for patching torch.nn.Linear with CublasLinear."
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/model_loaders"
 
     def load(self, ckpt_name, weight_dtype, compute_dtype, patch_cublaslinear, sage_attention, enable_fp16_accumulation):
         DTYPE_MAP = {
@@ -218,7 +221,7 @@ class DiffusionModelSelector():
     FUNCTION = "get_path"
     DESCRIPTION = "Returns the path to the model as a string."
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/model_loaders"
 
     def get_path(self, model_name):
         if "connector" in model_name.lower():
@@ -247,7 +250,7 @@ class DiffusionModelLoaderKJ():
     FUNCTION = "patch_and_load"
     DESCRIPTION = "Node for patching torch.nn.Linear with CublasLinear."
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/model_loaders"
 
     def patch_and_load(self, model_name, weight_dtype, compute_dtype, patch_cublaslinear, sage_attention, enable_fp16_accumulation, extra_state_dict=None):
         DTYPE_MAP = {
@@ -286,14 +289,10 @@ class DiffusionModelLoaderKJ():
         if extra_state_dict is not None:
             extra_sd = comfy.utils.load_torch_file(extra_state_dict)
             sd.update(extra_sd)
-            # If the model is a checkpoint, strip additional non-diffusion model entries before adding extra state dict
-            from comfy import model_detection
-            diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
-            if diffusion_model_prefix == "model.diffusion_model.":
-                temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
-                if len(temp_sd) > 0:
-                    sd = temp_sd
             del extra_sd
+
+            diffusion_model_prefix = comfy.sd.model_detection.unet_prefix_from_state_dict(sd)
+            sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=False)
 
         model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata)
         if dtype := DTYPE_MAP.get(compute_dtype):
@@ -360,7 +359,7 @@ class PatchModelPatcherOrder:
                 }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/deprecated"
     DESCRIPTION = "NO LONGER NECESSARY OR FUNCTIONAL, keeping node for backwards compatibility. Use the TorchCompileModelAdvanced to use LoRA with torch.compile."
     DEPRECATED = True
 
@@ -883,7 +882,7 @@ class WanVideoTeaCacheKJ:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "patch_teacache"
-    CATEGORY = "KJNodes/teacache"
+    CATEGORY = "KJNodes/deprecated"
     DEPRECATED = True
     DESCRIPTION = """
 Patch WanVideo model to use TeaCache. Speeds up inference by caching the output and  
@@ -1130,7 +1129,7 @@ class WanVideoEnhanceAVideoKJ:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "enhance"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/wan"
     DESCRIPTION = "https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video"
     EXPERIMENTAL = True
 
@@ -1181,7 +1180,16 @@ def ltxv_feta_forward(self, x, context=None, mask=None, pe=None, k_pe=None, tran
         out = comfy.ldm.modules.attention.optimized_attention(q, k, v, self.heads, attn_precision=self.attn_precision, transformer_options=transformer_options)
     else:
         out = comfy.ldm.modules.attention.optimized_attention_masked(q, k, v, self.heads, mask, attn_precision=self.attn_precision, transformer_options=transformer_options)
-    return self.to_out(out * feta_scores)
+
+    if self.to_gate_logits is not None:
+        gate_logits = self.to_gate_logits(x)  # (B, T, H)
+        b, t, _ = out.shape
+        out = out.view(b, t, self.heads, self.dim_head)
+        gates = 2.0 * torch.sigmoid(gate_logits)  # zero-init -> identity
+        out = out * gates.unsqueeze(-1)
+        out = out.view(b, t, self.heads * self.dim_head)
+
+    return self.to_out(out) * feta_scores
 
 
 class LTXCrossAttentionPatch:
@@ -1204,14 +1212,14 @@ class LTXVEnhanceAVideoKJ:
             "required": {
                 "model": ("MODEL",),
                 "latent": ("LATENT", {"tooltip": "Only used to get the latent count"}),
-                "weight": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "Strength of the enhance effect"}),
+                "weight": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 100.0, "step": 0.001, "tooltip": "Strength of the enhance effect"}),
            }
         }
 
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "enhance"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/ltxv"
     DESCRIPTION = "https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video"
     EXPERIMENTAL = True
 
@@ -1393,7 +1401,7 @@ class WanVideoNAG:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "patch"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/wan"
     DESCRIPTION = "https://github.com/ChenDarYen/Normalized-Attention-Guidance"
     EXPERIMENTAL = True
 
@@ -1566,7 +1574,7 @@ class GGUFLoaderKJ(io.ComfyNode):
 
         return io.Schema(
             node_id="GGUFLoaderKJ",
-            category="KJNodes/experimental",
+            category="KJNodes/model_loaders",
             description="Loads a GGUF model with advanced options, requires [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) to be installed.",
             is_experimental=True,
             inputs=[
@@ -1605,8 +1613,13 @@ class GGUFLoaderKJ(io.ComfyNode):
 
     @classmethod
     def _get_gguf_module(cls):
-        gguf_path = os.path.join(folder_paths.folder_names_and_paths["custom_nodes"][0][0], "ComfyUI-GGUF")
         """Import GGUF module with version validation"""
+        for key, mod in sys.modules.items():
+            if key.endswith("ComfyUI-GGUF") or key.endswith("comfyui-gguf"):
+                if hasattr(mod, "ops") and hasattr(mod, "nodes"):
+                    return mod
+
+        gguf_path = os.path.join(folder_paths.folder_names_and_paths["custom_nodes"][0][0], "ComfyUI-GGUF")
         for module_name in ["ComfyUI-GGUF", "custom_nodes.ComfyUI-GGUF", "comfyui-gguf", "custom_nodes.comfyui-gguf", gguf_path, gguf_path.lower()]:
             try:
                 module = importlib.import_module(module_name)
@@ -1826,7 +1839,7 @@ class StartRecordCUDAMemoryHistory():
     RETURN_TYPES = (IO.ANY, )
     RETURN_NAMES = ("input", "output_path",)
     FUNCTION = "start"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
     DESCRIPTION = "THIS NODE ALWAYS RUNS. Starts recording CUDA memory allocation history, can be ended and saved with EndRecordCUDAMemoryHistory. "
 
     def start(self, input, enabled, context, stacks, max_entries):
@@ -1852,7 +1865,7 @@ class EndRecordCUDAMemoryHistory():
     RETURN_TYPES = (IO.ANY, "STRING",)
     RETURN_NAMES = ("input", "output_path",)
     FUNCTION = "end"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
     DESCRIPTION = "Records CUDA memory allocation history between start and end, saves to a file that can be analyzed here: https://docs.pytorch.org/memory_viz or with VisualizeCUDAMemoryHistory node"
 
     def end(self, input, output_path):
@@ -1883,7 +1896,7 @@ class VisualizeCUDAMemoryHistory():
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
     FUNCTION = "visualize"
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
     DESCRIPTION = "Visualizes a CUDA memory allocation history file, opens in browser"
     OUTPUT_NODE = True
 
@@ -1932,7 +1945,7 @@ class ModelMemoryUseReportPatch:
     FUNCTION = "patch"
     DESCRIPTION = "Adds callbacks to model to report memory usage during after sampling"
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
 
     def patch(self, model):
         model_clone = model.clone()
@@ -1980,7 +1993,7 @@ class ModelMemoryUsageFactorOverride:
     FUNCTION = "patch"
     DESCRIPTION = "Overrides the memory usage factor of the model during sampling."
     EXPERIMENTAL = True
-    CATEGORY = "KJNodes/experimental"
+    CATEGORY = "KJNodes/memory"
 
     def patch(self, model, memory_usage_factor):
         model_clone = model.clone()

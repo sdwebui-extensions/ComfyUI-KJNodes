@@ -18,7 +18,7 @@ from io import BytesIO
 try:
     import cv2
 except:
-    print("OpenCV not installed")
+    logging.warning("OpenCV not installed")
     pass
 
 from PIL import ImageGrab, ImageDraw, ImageFont, Image, ImageOps, ImageSequence, ImageStat
@@ -27,9 +27,10 @@ from PIL.PngImagePlugin import PngInfo
 from nodes import MAX_RESOLUTION, SaveImage
 from comfy_extras.nodes_mask import composite
 from comfy.cli_args import args
-from comfy.utils import ProgressBar, common_upscale
+from comfy.utils import ProgressBar, common_upscale, tiled_scale_multidim
 from comfy import model_management
-from comfy_api.latest import io
+from comfy_api.latest import io, InputImpl, Types, ui
+from fractions import Fraction
 import node_helpers
 import folder_paths
 
@@ -139,7 +140,7 @@ https://github.com/hahnec/color-matcher/
                 return torch.from_numpy(image_result)
                 
             except Exception as e:
-                print(f"Thread {i} error: {e}")
+                logging.warning(f"Thread {i} error: {e}")
                 return torch.from_numpy(image_target_np_i)  # fallback
 
         if multithread and batch_size > 1:
@@ -450,8 +451,8 @@ class ImageConcatFromBatch:
         batch_size, height, width, channels = images.shape
         num_rows = (batch_size + num_columns - 1) // num_columns  # Calculate number of rows
 
-        print(f"Initial dimensions: batch_size={batch_size}, height={height}, width={width}, channels={channels}")
-        print(f"num_rows={num_rows}, num_columns={num_columns}")
+        logging.info(f"Initial dimensions: batch_size={batch_size}, height={height}, width={width}, channels={channels}")
+        logging.info(f"num_rows={num_rows}, num_columns={num_columns}")
 
         if match_image_size:
             target_shape = images[0].shape
@@ -469,7 +470,7 @@ class ImageConcatFromBatch:
                     target_width = target_shape[1]
                     target_height = int(target_width / original_aspect_ratio)
 
-                print(f"Resizing image from ({original_height}, {original_width}) to ({target_height}, {target_width})")
+                logging.info(f"Resizing image from ({original_height}, {original_width}) to ({target_height}, {target_width})")
 
                 # Resize the image to match the target size while preserving aspect ratio
                 resized_image = common_upscale(image.movedim(-1, 0), target_width, target_height, "lanczos", "disabled")
@@ -485,7 +486,7 @@ class ImageConcatFromBatch:
         grid_height = num_rows * height
         grid_width = num_columns * width
 
-        print(f"Grid dimensions before scaling: grid_height={grid_height}, grid_width={grid_width}")
+        logging.info(f"Grid dimensions before scaling: grid_height={grid_height}, grid_width={grid_width}")
 
         # Original scale factor calculation remains unchanged
         scale_factor = min(max_resolution / grid_height, max_resolution / grid_width, 1.0)
@@ -506,8 +507,8 @@ class ImageConcatFromBatch:
         # Recalculate grid dimensions with adjusted height and width
         grid_height = num_rows * height
         grid_width = num_columns * width
-        print(f"Grid dimensions after scaling: grid_height={grid_height}, grid_width={grid_width}")
-        print(f"Final image dimensions: height={height}, width={width}")
+        logging.info(f"Grid dimensions after scaling: grid_height={grid_height}, grid_width={grid_width}")
+        logging.info(f"Final image dimensions: height={height}, width={width}")
 
         grid = torch.zeros((grid_height, grid_width, channels), dtype=images.dtype)
 
@@ -667,7 +668,7 @@ Can be used for realtime diffusion with autoqueue.
                 time.sleep(delay)
 
         elapsed_time = time.time() - start_time
-        print(f"screengrab took {elapsed_time} seconds.")
+        logging.info(f"screengrab took {elapsed_time} seconds.")
         
         return (torch.cat(captures, dim=0),)
     
@@ -958,9 +959,8 @@ and passes the latent through unchanged.
             "text": [f"{B}x{C}x{T}x{H}x{W}"]}, 
             "result": (latent, B, C, T, H, W) 
         }
-    
+
 class ImageBatchRepeatInterleaving:
-    
     RETURN_TYPES = ("IMAGE", "MASK",)
     FUNCTION = "repeat"
     CATEGORY = "KJNodes/image"
@@ -981,21 +981,20 @@ with repeats 2 becomes batch of 10 images: 0, 0, 1, 1, 2, 2, 3, 3, 4, 4
                 "mask": ("MASK",),
             }
         }
-    
+
     def repeat(self, images, repeats, mask=None):
         original_count = images.shape[0]
         total_count = original_count * repeats
-       
+
         repeated_images = torch.repeat_interleave(images, repeats=repeats, dim=0)
         if mask is not None:
             mask = torch.repeat_interleave(mask, repeats=repeats, dim=0)
         else:
-            mask = torch.zeros((total_count, images.shape[1], images.shape[2]), 
+            mask = torch.zeros((total_count, images.shape[1], images.shape[2]),
                               device=images.device, dtype=images.dtype)
             for i in range(original_count):
                 mask[i * repeats] = 1.0
 
-        print("mask shape", mask.shape)
         return (repeated_images, mask)
 
 class ImageUpscaleWithModelBatched:
@@ -1102,7 +1101,7 @@ class SplitImageChannels:
             "image": ("IMAGE",),
             },
             }
-    
+
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK")
     RETURN_NAMES = ("red", "green", "blue", "mask")
     FUNCTION = "split"
@@ -1111,20 +1110,22 @@ class SplitImageChannels:
 Splits image channels into images where the selected channel  
 is repeated for all channels, and the alpha as a mask. 
 """
-        
+
     def split(self, image):
         red = image[:, :, :, 0:1] # Red channel
         green = image[:, :, :, 1:2] # Green channel
         blue = image[:, :, :, 2:3] # Blue channel
-        alpha = image[:, :, :, 3:4] # Alpha channel
-        alpha = alpha.squeeze(-1)
+        if image.shape[3] == 4:
+            alpha = image[:, :, :, 4] # Alpha channel
+        else:
+            alpha = torch.zeros(image.shape[0], image.shape[1], image.shape[2], device=image.device)
 
         # Repeat the selected channel for all channels
         red = torch.cat([red, red, red], dim=3)
         green = torch.cat([green, green, green], dim=3)
         blue = torch.cat([blue, blue, blue], dim=3)
         return (red, green, blue, alpha)
-    
+
 class MergeImageChannels:
     @classmethod
     def INPUT_TYPES(s):
@@ -1184,7 +1185,7 @@ class ImagePadForOutpaintMasked:
     def expand_image(self, image, left, top, right, bottom, feathering, mask=None):
         if mask is not None:
             if torch.allclose(mask, torch.zeros_like(mask)):
-                    print("Warning: The incoming mask is fully black. Handling it as None.")
+                    logging.warning("The incoming mask is fully black. Handling it as None.")
                     mask = None
         B, H, W, C = image.size()
 
@@ -1324,7 +1325,7 @@ class ImagePrepForICLora:
 
         if reference_mask is not None:
             if torch.allclose(reference_mask, torch.zeros_like(reference_mask)):
-                    print("Warning: The incoming mask is fully black. Handling it as None.")
+                    logging.warning("The incoming mask is fully black. Handling it as None.")
                     reference_mask = None
         image = reference_image
         if latent_image is not None:
@@ -1339,7 +1340,6 @@ class ImagePrepForICLora:
                 size=(H, W),
                 mode='nearest'
             ).squeeze(1)
-            print(resized_mask.shape)
             image = image * resized_mask.unsqueeze(-1)
 
         # Calculate new width maintaining aspect ratio
@@ -1950,7 +1950,7 @@ Then on another copy of the node provide the newly generated frames and choose h
     }
 
     def imagesfrombatch(self, source_images, overlap, overlap_side, overlap_mode, new_images=None):
-        if overlap >= len(source_images):
+        if overlap > len(source_images):
             return source_images, source_images, source_images
 
         if new_images is not None:
@@ -2399,7 +2399,6 @@ class ImageBatchMulti:
             "required": {
                 "inputcount": ("INT", {"default": 2, "min": 2, "max": 1000, "step": 1}),
                 "image_1": ("IMAGE", ),
-                
             },
             "optional": {
                 "image_2": ("IMAGE", ),
@@ -2417,14 +2416,39 @@ with the **inputcount** and clicking update.
 """
 
     def combine(self, inputcount, **kwargs):
-        from nodes import ImageBatch
-        image_batch_node = ImageBatch()
-        image = kwargs["image_1"].cpu()
-        first_image_shape = image.shape
+        first = kwargs["image_1"]
+        h, w = first.shape[1], first.shape[2]
+
+        # determine output shape
+        max_ch = first.shape[-1]
+        total_frames = first.shape[0]
         for c in range(1, inputcount):
-            new_image = kwargs.get(f"image_{c + 1}", torch.zeros(first_image_shape)).cpu()
-            image, = image_batch_node.batch(image, new_image)
-        return (image,)
+            img = kwargs.get(f"image_{c + 1}")
+            if img is not None:
+                max_ch = max(max_ch, img.shape[-1])
+                total_frames += img.shape[0]
+            else:
+                total_frames += first.shape[0]
+
+        # pre-allocate output
+        out = torch.empty((total_frames, h, w, max_ch), dtype=first.dtype)
+        offset = 0
+
+        for c in range(inputcount):
+            img = kwargs.get(f"image_{c + 1}", torch.zeros((first.shape[0], h, w, max_ch), dtype=first.dtype))
+
+            if img.shape[1:3] != (h, w):
+                img = common_upscale(img.movedim(-1, 1), w, h, "bilinear", "center").movedim(1, -1)
+
+            if img.shape[-1] < max_ch:
+                img = torch.nn.functional.pad(img, (0, max_ch - img.shape[-1]), mode='constant', value=1.0)
+
+            n = img.shape[0]
+            out[offset:offset + n].copy_(img, non_blocking=True)
+            offset += n
+            del img
+
+        return (out.cpu(),)
 
 
 class ImageTensorList:
@@ -2609,7 +2633,7 @@ class PreviewAnimation:
                 mask_img = Image.fromarray(np.clip(mask_np, 0, 255).astype(np.uint8))
                 pil_images.append(mask_img)
         else:
-            print("PreviewAnimation: No images or masks provided")
+            logging.warning("PreviewAnimation: No images or masks provided")
             return { "ui": { "images": results, "animated": (None,), "text": "empty" }}
 
         num_frames = len(pil_images)
@@ -2706,7 +2730,7 @@ v2 of the node. This node is only kept to not completely break older workflows.
         return(image, image.shape[2], image.shape[1],)
 
 class ImageResizeKJv2:
-    upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
+    upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos", "nvidia_rtx_vsr"]
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -2837,9 +2861,23 @@ highest dimension.
                     except:
                         pass
                 else:
-                    print(f"[ImageResizeKJv2] estimated output ~{est_mb:.2f} MB; batching {per_batch}/{B}")
+                    logging.info(f"[ImageResizeKJv2] estimated output ~{est_mb:.2f} MB; batching {per_batch}/{B}")
             except:
                 pass
+
+        # NVIDIA RTX Video Super Resolution setup
+        nvvfx_sr = None
+        nvvfx_ctx = None
+        if upscale_method == "nvidia_rtx_vsr":
+            try:
+                import nvvfx
+            except:
+                raise ImportError("NVIDIA RTX Video Super Resolution is not available. Please install the nvidia-vfx library and ensure you have a compatible NVIDIA GPU.")
+            nvvfx_ctx = nvvfx.VideoSuperRes(nvvfx.effects.QualityLevel.ULTRA)
+            nvvfx_sr = nvvfx_ctx.__enter__()
+            nvvfx_sr.output_width = max(8, round(width / 8) * 8)
+            nvvfx_sr.output_height = max(8, round(height / 8) * 8)
+            nvvfx_sr.load()
 
         def _process_subbatch(in_image, in_mask, pad_left, pad_right, pad_top, pad_bottom):
             # Avoid unnecessary clones; only move if needed
@@ -2877,12 +2915,23 @@ highest dimension.
                 if out_mask is not None:
                     out_mask = out_mask.narrow(-1, x, crop_w).narrow(-2, y, crop_h)
 
-            out_image = common_upscale(out_image.movedim(-1,1), width, height, upscale_method, crop="disabled").movedim(1,-1)
-            if out_mask is not None:
-                if upscale_method == "lanczos":
-                    out_mask = common_upscale(out_mask.unsqueeze(1).repeat(1, 3, 1, 1), width, height, upscale_method, crop="disabled").movedim(1,-1)[:, :, :, 0]
-                else:
-                    out_mask = common_upscale(out_mask.unsqueeze(1), width, height, upscale_method, crop="disabled").squeeze(1)
+            if upscale_method == "nvidia_rtx_vsr":
+                # Process each frame through RTX Video Super Resolution
+                frames_chw = out_image.movedim(-1, 1).cuda().contiguous()
+                upscaled_frames = []
+                for j in range(frames_chw.shape[0]):
+                    dlpack_out = nvvfx_sr.run(frames_chw[j]).image
+                    upscaled_frames.append(torch.from_dlpack(dlpack_out).clone())
+                out_image = torch.stack(upscaled_frames, dim=0).movedim(1, -1).cpu()
+                if out_mask is not None:
+                    out_mask = common_upscale(out_mask.unsqueeze(1), width, height, "bilinear", crop="disabled").squeeze(1)
+            else:
+                out_image = common_upscale(out_image.movedim(-1,1), width, height, upscale_method, crop="disabled").movedim(1,-1)
+                if out_mask is not None:
+                    if upscale_method == "lanczos":
+                        out_mask = common_upscale(out_mask.unsqueeze(1).repeat(1, 3, 1, 1), width, height, upscale_method, crop="disabled").movedim(1,-1)[:, :, :, 0]
+                    else:
+                        out_mask = common_upscale(out_mask.unsqueeze(1), width, height, upscale_method, crop="disabled").squeeze(1)
 
             # Pad logic
             if (keep_proportion.startswith("pad") or pillarbox_blur) and (pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0):
@@ -2936,7 +2985,7 @@ highest dimension.
                         pass
                 else:
                     try:
-                        print(f"[ImageResizeKJv2] batch {current_batch}/{total_batches} · images {end_idx}/{B}")
+                        logging.info(f"[ImageResizeKJv2] batch {current_batch}/{total_batches} · images {end_idx}/{B}")
                     except:
                         pass
             out_image = torch.cat(chunks, dim=0)
@@ -2944,6 +2993,10 @@ highest dimension.
                 out_mask = torch.cat([m for m in mask_chunks if m is not None], dim=0)
             else:
                 out_mask = None
+
+        # Cleanup NVIDIA RTX VSR context
+        if nvvfx_ctx is not None:
+            nvvfx_ctx.__exit__(None, None, None)
 
         # Progress UI
         if unique_id and PromptServer is not None:
@@ -3351,7 +3404,6 @@ class ImageGridtoBatch:
 
     def decompose(self, image, columns, rows):
         B, H, W, C = image.shape
-        print("input size: ", image.shape)
 
         # Calculate cell width, rounding down
         cell_width = W // columns
@@ -3811,7 +3863,6 @@ class ImageCropByMaskBatch:
         mask_count = BM
         if HM != H or WM != W:
             masks = F.interpolate(masks.unsqueeze(1), size=(H, W), mode='nearest-exact').squeeze(1)
-            print(masks.shape)
         output_images = []
         output_masks = []
 
@@ -4136,7 +4187,7 @@ class LoadVideosFromFolder:
                 if len(file_parts) > 1 and (file_parts[-1].lower() in ['webm', 'mp4', 'mkv', 'gif', 'mov']):
                     videos_list.append(os.path.join(kwargs['video'], f))
                     filenames.append(f)
-        print(videos_list)
+
         kwargs.pop('video')
         loaded_videos = []
         for idx, video in enumerate(videos_list):
@@ -4206,7 +4257,6 @@ class LoadVideosFromFolder:
                 row_tensor = torch.cat(padded_row_videos, dim=2)  # Concatenate horizontally
                 row_tensors.append(row_tensor)
             out_tensor = torch.cat(row_tensors, dim=1)  # Concatenate rows vertically
-        print(out_tensor.shape)
         return out_tensor,
 
     @classmethod
@@ -4214,3 +4264,468 @@ class LoadVideosFromFolder:
         if s.vhs_nodes is not None:
             return s.vhs_nodes.utils.hash_path(video)
         return None
+
+
+class EncodeVideoComponents(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        position_options = ["center", "top", "bottom", "left", "right"]
+        options = [
+            io.DynamicCombo.Option(key="stretch", inputs=[]),
+            io.DynamicCombo.Option(key="resize", inputs=[]),
+            io.DynamicCombo.Option(key="total_pixels", inputs=[]),
+            io.DynamicCombo.Option(key="crop", inputs=[
+                io.Combo.Input("crop_position", options=position_options, tooltip="Position to crop from."),
+            ]),
+            io.DynamicCombo.Option(key="pad", inputs=[
+                io.String.Input("pad_color", default="0, 0, 0", tooltip="Color to use for padding."),
+                io.Combo.Input("pad_position", options=position_options, tooltip="Position to align the image within the padded area."),
+            ]),
+            io.DynamicCombo.Option(key="pad_edge", inputs=[
+                io.Combo.Input("pad_position", options=position_options, tooltip="Position to align the image within the padded area."),
+            ]),
+            io.DynamicCombo.Option(key="pad_edge_pixel", inputs=[
+                io.Combo.Input("pad_position", options=position_options, tooltip="Position to align the image within the padded area."),
+            ]),
+            io.DynamicCombo.Option(key="pillarbox_blur", inputs=[
+                io.Combo.Input("pad_position", options=position_options, tooltip="Position to align the image within the padded area."),
+            ]),
+        ]
+        return io.Schema(
+            node_id="EncodeVideoComponents",
+            search_aliases=["video to latent", "encode video", "vae encode video"],
+            display_name="Encode Video Components",
+            category="KJNodes/image",
+            description="Extracts video frames, resizes them, and encodes with a VAE directly, avoiding storing the full image tensor.",
+            inputs=[
+                io.Video.Input("video", tooltip="The video to extract and encode."),
+                io.Vae.Input("vae", tooltip="The VAE model to use for encoding."),
+                io.Int.Input("width", default=768, min=0, max=16384, step=2, tooltip="Target width for the frames before encoding. 0 = original width."),
+                io.Int.Input("height", default=512, min=0, max=16384, step=2, tooltip="Target height for the frames before encoding. 0 = original height."),
+                io.Int.Input("max_frames", default=0, min=0, max=999999, step=1, tooltip="Maximum number of frames. 0 = no limit."),
+                io.Combo.Input("upscale_method", options=["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], default="lanczos", tooltip="Interpolation method for resizing."),
+                io.DynamicCombo.Input(
+                    "keep_proportion",
+                    options=options,
+                    display_name="Keep Proportion",
+                    tooltip="How to handle aspect ratio mismatch when resizing.",
+                ),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+                io.Audio.Output(display_name="audio"),
+                io.Float.Output(display_name="fps"),
+                io.Int.Output(display_name="frame_count", tooltip="Number pixel space frames after any possible cropping"),
+            ],
+        )
+
+    @staticmethod
+    def _compute_resize_params(mode, position, width, height, src_w, src_h):
+        """Compute target resize dimensions, crop region, and padding from keep_proportion mode."""
+        if width == 0:
+            width = src_w
+        if height == 0:
+            height = src_h
+        pillarbox_blur = mode == "pillarbox_blur"
+        pad_left = pad_right = pad_top = pad_bottom = 0
+        crop_region = None  # (x, y, crop_w, crop_h) or None
+
+        if mode in ["resize", "total_pixels"] or mode.startswith("pad") or pillarbox_blur:
+            if mode == "total_pixels":
+                total_pixels = width * height
+                aspect_ratio = src_w / src_h
+                new_height = int(math.sqrt(total_pixels / aspect_ratio))
+                new_width = int(math.sqrt(total_pixels * aspect_ratio))
+            else:
+                ratio = min(width / src_w, height / src_h)
+                new_width = round(src_w * ratio)
+                new_height = round(src_h * ratio)
+
+            if mode.startswith("pad") or pillarbox_blur:
+                if position == "center":
+                    pad_left = (width - new_width) // 2
+                    pad_right = width - new_width - pad_left
+                    pad_top = (height - new_height) // 2
+                    pad_bottom = height - new_height - pad_top
+                elif position == "top":
+                    pad_left = (width - new_width) // 2
+                    pad_right = width - new_width - pad_left
+                    pad_top = 0
+                    pad_bottom = height - new_height
+                elif position == "bottom":
+                    pad_left = (width - new_width) // 2
+                    pad_right = width - new_width - pad_left
+                    pad_top = height - new_height
+                    pad_bottom = 0
+                elif position == "left":
+                    pad_left = 0
+                    pad_right = width - new_width
+                    pad_top = (height - new_height) // 2
+                    pad_bottom = height - new_height - pad_top
+                elif position == "right":
+                    pad_left = width - new_width
+                    pad_right = 0
+                    pad_top = (height - new_height) // 2
+                    pad_bottom = height - new_height - pad_top
+
+            width = new_width
+            height = new_height
+
+        if mode == "crop":
+            old_aspect = src_w / src_h
+            new_aspect = width / height
+            if old_aspect > new_aspect:
+                crop_w = round(src_h * new_aspect)
+                crop_h = src_h
+            else:
+                crop_w = src_w
+                crop_h = round(src_w / new_aspect)
+            if position == "center":
+                x = (src_w - crop_w) // 2
+                y = (src_h - crop_h) // 2
+            elif position == "top":
+                x = (src_w - crop_w) // 2
+                y = 0
+            elif position == "bottom":
+                x = (src_w - crop_w) // 2
+                y = src_h - crop_h
+            elif position == "left":
+                x = 0
+                y = (src_h - crop_h) // 2
+            elif position == "right":
+                x = src_w - crop_w
+                y = (src_h - crop_h) // 2
+            crop_region = (x, y, crop_w, crop_h)
+
+        return width, height, crop_region, (pad_left, pad_right, pad_top, pad_bottom)
+
+    @classmethod
+    def execute(cls, video, vae, width, height, max_frames, upscale_method, keep_proportion) -> io.NodeOutput:
+        import av
+        import itertools
+
+        mode = keep_proportion["keep_proportion"]
+        position = keep_proportion.get("crop_position") or keep_proportion.get("pad_position", "center")
+        pad_color = keep_proportion.get("pad_color", "0, 0, 0")
+        target_dtype = vae.vae_dtype
+
+        # Access VideoFromFile internals for efficient per-frame decode
+        source = video.get_stream_source()
+        start_time = getattr(video, '_VideoFromFile__start_time', 0)
+        duration = getattr(video, '_VideoFromFile__duration', 0)
+
+        # Get frame count for progress bar, capped by max_frames
+        try:
+            total_frames = video.get_frame_count()
+        except (ValueError, AttributeError):
+            total_frames = 0
+        if max_frames > 0 and total_frames > 0:
+            total_frames = min(total_frames, max_frames)
+        pbar = ProgressBar(total_frames) if total_frames > 0 else None
+
+        # Lanczos requires PIL (CPU-only), all other methods use torch on GPU
+        use_gpu = upscale_method != "lanczos"
+        device = model_management.get_torch_device() if use_gpu else torch.device("cpu")
+
+        # --- Decode video frames with per-frame resize + dtype cast ---
+        with av.open(source, mode='r') as container:
+            video_stream = container.streams.video[0]
+            start_pts = int(start_time / video_stream.time_base)
+            end_pts = int((start_time + duration) / video_stream.time_base) if duration else 0
+            container.seek(start_pts, stream=video_stream)
+
+            res_w, res_h, crop_region, padding = None, None, None, (0, 0, 0, 0)
+            frames = []
+            for frame in container.decode(video_stream):
+                if frame.pts < start_pts:
+                    continue
+                if duration and frame.pts >= end_pts:
+                    break
+                if max_frames > 0 and len(frames) >= max_frames:
+                    break
+
+                if res_w is None:
+                    src_h, src_w = frame.height, frame.width
+                    res_w, res_h, crop_region, padding = cls._compute_resize_params(
+                        mode, position, width, height, src_w, src_h
+                    )
+
+                # Decode to tensor and normalize
+                img = torch.from_numpy(frame.to_ndarray(format='rgb24')).to(device=device, dtype=torch.float32) / 255.0
+
+                # Crop if needed (before resize)
+                if crop_region is not None:
+                    cx, cy, cw, ch = crop_region
+                    img = img[cy:cy+ch, cx:cx+cw, :]
+
+                # Resize (GPU for torch-native methods, CPU/PIL for lanczos)
+                img = common_upscale(
+                    img.unsqueeze(0).movedim(-1, 1), res_w, res_h, upscale_method, crop="disabled"
+                ).movedim(1, -1).squeeze(0).to(dtype=target_dtype, device="cpu")
+
+                frames.append(img)
+                if pbar is not None:
+                    pbar.update(1)
+
+            frame_rate = video_stream.average_rate if video_stream.average_rate else 1
+
+        s = torch.stack(frames) if frames else torch.zeros(0, height, width, 3, dtype=target_dtype)
+
+        # Pad logic (applied on the full stack since padding modes like pillarbox_blur need all frames)
+        pillarbox_blur = mode == "pillarbox_blur"
+        pad_left, pad_right, pad_top, pad_bottom = padding
+        if (mode.startswith("pad") or pillarbox_blur) and (pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0):
+            pad_mode = (
+                "pillarbox_blur" if pillarbox_blur else
+                "edge" if mode == "pad_edge" else
+                "edge_pixel" if mode == "pad_edge_pixel" else
+                "color"
+            )
+            s, _ = ImagePadKJ.pad(None, s, pad_left, pad_right, pad_top, pad_bottom, 0, pad_color, pad_mode)
+
+        # Trim frames to a count valid for the VAE's temporal compression
+        try:
+            temporal_compress = vae.downscale_ratio[0]
+            temporal_decompress = vae.upscale_ratio[0]
+            valid_frames = temporal_decompress(temporal_compress(s.shape[0]))
+            if valid_frames < s.shape[0]:
+                logging.warning(f"[EncodeVideoComponents] Trimming {s.shape[0] - valid_frames} frames ({s.shape[0]} -> {valid_frames}) to match VAE temporal compression ratio")
+                s = s[:valid_frames]
+        except (TypeError, IndexError):
+            pass
+
+        t = vae.encode(s)
+
+        # --- Extract audio in a separate pass ---
+        audio = None
+        if isinstance(source, BytesIO):
+            source.seek(0)
+        with av.open(source, mode='r') as container:
+            if len(container.streams.audio):
+                audio_stream = container.streams.audio[-1]
+                if start_time > 0:
+                    audio_start_pts = int(start_time / audio_stream.time_base)
+                    container.seek(audio_start_pts, stream=audio_stream)
+                audio_frames = []
+                resample = av.audio.resampler.AudioResampler(format='fltp').resample
+                aframes = itertools.chain.from_iterable(
+                    map(resample, container.decode(audio_stream))
+                )
+                has_first_frame = False
+                for aframe in aframes:
+                    offset_seconds = start_time - aframe.time
+                    to_skip = int(offset_seconds * audio_stream.sample_rate)
+                    if to_skip < aframe.samples:
+                        has_first_frame = True
+                        break
+                if has_first_frame:
+                    audio_frames.append(aframe.to_ndarray()[..., to_skip:])
+                    for aframe in aframes:
+                        if duration and aframe.time > start_time + duration:
+                            break
+                        audio_frames.append(aframe.to_ndarray())
+                if audio_frames:
+                    audio_data = np.concatenate(audio_frames, axis=1)
+                    if duration:
+                        audio_data = audio_data[..., :int(duration * audio_stream.sample_rate)]
+                    audio = {
+                        "waveform": torch.from_numpy(audio_data).unsqueeze(0),
+                        "sample_rate": int(audio_stream.sample_rate) if audio_stream.sample_rate else 1,
+                    }
+
+        return io.NodeOutput({"samples": t}, audio, float(frame_rate), s.shape[0])
+
+
+class DecodeAndSaveVideo(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="DecodeAndSaveVideo",
+            search_aliases=["video to latent", "decode video"],
+            display_name="Decode and Save Video",
+            category="KJNodes/image",
+            description="Decodes video frames and audio from latent representations, combines them, and saves as a video file, without keeping intermediate images in memory.",
+            inputs=[
+                io.Latent.Input("video_latent", tooltip="The latent representation of the video frames."),
+                io.Latent.Input("audio_latent", optional=True, tooltip="The latent representation of the audio frames."),
+                io.Float.Input("fps", default=25.0, min=0.0, max=999.0, step=0.01, tooltip="Frame rate for the output video."),
+                io.String.Input("filename_prefix", default="video/ComfyUI", tooltip="The prefix for the file to save. This may include formatting information such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes."),
+                io.Combo.Input("format", options=Types.VideoContainer.as_input(), default="auto", tooltip="The format to save the video as."),
+                io.Combo.Input("codec", options=Types.VideoCodec.as_input(), default="auto", tooltip="The codec to use for the video."),
+                io.Vae.Input("video_vae", tooltip="The VAE model to use for encoding."),
+                io.Vae.Input("audio_vae", optional=True, tooltip="The VAE model to use for decoding audio."),
+                io.DynamicCombo.Input("tiling", options=[
+                    io.DynamicCombo.Option(key="disabled", inputs=[]),
+                    io.DynamicCombo.Option(key="enabled", inputs=[
+                        io.Int.Input("tile_size", default=512, min=64, max=4096, step=32, tooltip="Size of the tiles to decode. Smaller tiles use less memory but take more time."),
+                        io.Int.Input("overlap", default=64, min=0, max=4096, step=32, tooltip="Amount of overlap between tiles. Higher overlap can improve quality at the edges of tiles but uses more memory and takes more time."),
+                        io.Int.Input("temporal_size", default=4096, min=8, max=4096, step=4, tooltip="Only used for video VAEs: Amount of frames to decode at a time. Higher value than number of frames = disabled"),
+                        io.Int.Input("temporal_overlap", default=16, min=4, max=4096, step=4, tooltip="Only used for video VAEs: Amount of frames to overlap. Higher overlap can improve quality at the edges of temporal tiles but uses more memory and takes more time."),
+                    ]),
+                ]),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, video_latent, video_vae, filename_prefix, format, codec, tiling, audio_latent=None, audio_vae=None, fps=25.0) -> io.NodeOutput:
+        if tiling["tiling"] == "enabled":
+            tile_size = tiling["tile_size"]
+            overlap = tiling["overlap"]
+            temporal_size = tiling["temporal_size"]
+            temporal_overlap = tiling["temporal_overlap"]
+
+            if tile_size < overlap * 4:
+                overlap = tile_size // 4
+            if temporal_size < temporal_overlap * 2:
+                temporal_overlap = temporal_overlap // 2
+            temporal_compression = video_vae.temporal_compression_decode()
+            if temporal_compression is not None:
+                temporal_size = max(2, temporal_size // temporal_compression)
+                temporal_overlap = max(1, min(temporal_size // 2, temporal_overlap // temporal_compression))
+            else:
+                temporal_size = None
+                temporal_overlap = None
+
+            compression = video_vae.spacial_compression_decode()
+
+            images = cls.decode_tiled(video_vae, video_latent["samples"],
+                                      tile_t=max(2, temporal_size),
+                                      tile_x=tile_size // compression,
+                                      tile_y=tile_size // compression,
+                                      overlap=(temporal_overlap if temporal_overlap is not None else 1, max(1, overlap // compression), max(1, overlap // compression)),
+            ).movedim(1, -1)
+            if len(images.shape) == 5: #Combine batches
+                images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        else:
+            images = cls.decode_video(video_vae, video_latent)
+
+        if audio_latent is not None:
+            if audio_vae is None:
+                raise ValueError("Audio VAE must be provided if audio latent is provided.")
+            audio = cls.decode_audio(audio_latent, audio_vae)
+        else:
+            audio = None
+
+        video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=audio, frame_rate=Fraction(fps)))
+        file, subfolder = cls.save_video(video, filename_prefix, format, codec)
+
+        return io.NodeOutput(ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]))
+
+    @classmethod
+    def decode_video(cls, vae, samples):
+        samples_in = samples["samples"]
+        if samples_in.is_nested:
+            samples_in = samples_in.unbind()[0]
+
+        vae.throw_exception_if_invalid()
+        pixel_samples = None
+        do_tile = False
+        if vae.latent_dim == 2 and samples_in.ndim == 5:
+            samples_in = samples_in[:, :, 0]
+        try:
+            memory_used = vae.memory_used_decode(samples_in.shape, vae.vae_dtype)
+            model_management.load_models_gpu([vae.patcher], memory_required=memory_used, force_full_load=True)
+            free_memory = vae.patcher.get_free_memory(vae.device)
+            batch_number = int(free_memory / memory_used)
+            batch_number = max(1, batch_number)
+
+            for x in range(0, samples_in.shape[0], batch_number):
+                samples = samples_in[x:x+batch_number].to(vae.vae_dtype).to(vae.device)
+                out = vae.process_output(vae.first_stage_model.decode(samples).to(vae.output_device).to(torch.float16))
+                if pixel_samples is None:
+                    pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=vae.output_device, dtype=out.dtype)
+                pixel_samples[x:x+batch_number] = out
+        except Exception as e:
+            model_management.raise_non_oom(e)
+            logging.warning("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
+            do_tile = True
+
+        if do_tile:
+            dims = samples_in.ndim - 2
+            if dims == 1 or cls.extra_1d_channel is not None:
+                pixel_samples = vae.decode_tiled_1d(samples_in)
+            elif dims == 2:
+                pixel_samples = vae.decode_tiled_2d(samples_in)
+            elif dims == 3:
+                tile = 256 // vae.spacial_compression_decode()
+                overlap = tile // 4
+                pixel_samples = vae.decode_tiled_3d(samples_in, tile_x=tile, tile_y=tile, overlap=(1, overlap, overlap))
+
+        pixel_samples = pixel_samples.to(vae.output_device).movedim(1,-1)
+
+        if len(pixel_samples.shape) == 5: #Combine batches
+            pixel_samples = pixel_samples.reshape(-1, pixel_samples.shape[-3], pixel_samples.shape[-2], pixel_samples.shape[-1])
+        return pixel_samples
+
+    @classmethod
+    def decode_tiled(cls, vae, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
+        vae.throw_exception_if_invalid()
+        memory_used = vae.memory_used_decode(samples.shape, vae.vae_dtype)
+        model_management.load_models_gpu([vae.patcher], memory_required=memory_used, force_full_load=vae.disable_offload)
+        decode_fn = lambda a: vae.first_stage_model.decode(a.to(vae.vae_dtype).to(vae.device)).to(torch.float16)
+        return vae.process_output(tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap,
+                                                       upscale_amount=vae.upscale_ratio, out_channels=vae.output_channels, index_formulas=vae.upscale_index_formula, output_device=vae.output_device))
+
+
+    @classmethod
+    def decode_audio(cls, samples, audio_vae):
+        audio_latent = samples["samples"]
+        if audio_latent.is_nested:
+            audio_latent = audio_latent.unbind()[-1]
+        audio = audio_vae.decode(audio_latent).to(audio_latent.device)
+        output_audio_sample_rate = audio_vae.output_sample_rate
+        return {"waveform": audio, "sample_rate": int(output_audio_sample_rate)}
+
+    @classmethod
+    def save_video(cls, video, filename_prefix, format, codec) -> io.NodeOutput:
+        width, height = video.get_dimensions()
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix,
+            folder_paths.get_output_directory(),
+            width,
+            height
+        )
+        saved_metadata = None
+        if not args.disable_metadata:
+            metadata = {}
+            if cls.hidden.extra_pnginfo is not None:
+                metadata.update(cls.hidden.extra_pnginfo)
+            if cls.hidden.prompt is not None:
+                metadata["prompt"] = cls.hidden.prompt
+            if len(metadata) > 0:
+                saved_metadata = metadata
+        file = f"{filename}_{counter:05}_.{Types.VideoContainer.get_extension(format)}"
+        video.save_to(
+            os.path.join(full_output_folder, file),
+            format=Types.VideoContainer(format),
+            codec=codec,
+            metadata=saved_metadata
+        )
+        return file, subfolder
+
+
+class PreviewImageOrMask(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PreviewImageOrMask",
+            display_name="Preview Image Or Mask",
+            category="image",
+            essentials_category="Basics",
+            description="Previews the input images or masks.",
+            search_aliases=["output"],
+            inputs=[
+                io.MultiType.Input("input", [io.Image, io.Mask], tooltip="The image or mask to preview."),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, input) -> io.NodeOutput:
+        if input.ndim == 3:
+            return io.NodeOutput(ui=ui.PreviewMask(input, cls=cls))
+        return io.NodeOutput(ui=ui.PreviewImage(input, cls=cls))
+
