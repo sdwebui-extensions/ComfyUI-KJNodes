@@ -13,9 +13,9 @@ import logging
 from comfy import model_management
 import folder_paths
 from nodes import MAX_RESOLUTION
-from comfy.utils import common_upscale, ProgressBar, load_torch_file, save_torch_file
+from comfy.utils import common_upscale, ProgressBar, load_torch_file, save_torch_file, state_dict_prefix_replace
 from comfy.comfy_types.node_typing import IO
-from comfy_api.latest import io
+from comfy_api.latest import io, ui
 import comfy.latent_formats
 import node_helpers
 from io import BytesIO
@@ -1549,45 +1549,6 @@ https://huggingface.co/stabilityai/sv3d
         latent = torch.zeros([batch_size, 4, height // 8, width // 8])
         return (final_positive, final_negative, {"samples": latent})
 
-class LoadResAdapterNormalization:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "resadapter_path": (folder_paths.get_filename_list("checkpoints"), )
-            } 
-        }
-
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "load_res_adapter"
-    CATEGORY = "KJNodes/experimental"
-
-    def load_res_adapter(self, model, resadapter_path):
-        logging.info("ResAdapter: Checking ResAdapter path")
-        resadapter_full_path = folder_paths.get_full_path("checkpoints", resadapter_path)
-        if not os.path.exists(resadapter_full_path):
-            raise Exception("Invalid model path")
-        else:
-            logging.info("ResAdapter: Loading ResAdapter normalization weights")
-            prefix_to_remove = 'diffusion_model.'
-            model_clone = model.clone()
-            norm_state_dict = load_torch_file(resadapter_full_path)
-            new_values = {key[len(prefix_to_remove):]: value for key, value in norm_state_dict.items() if key.startswith(prefix_to_remove)}
-            logging.info("ResAdapter: Attempting to add patches with ResAdapter weights")
-            try:
-                for key in model.model.diffusion_model.state_dict().keys():
-                    if key in new_values:
-                        original_tensor = model.model.diffusion_model.state_dict()[key]
-                        new_tensor = new_values[key].to(model.model.diffusion_model.dtype)
-                        if original_tensor.shape == new_tensor.shape:
-                            model_clone.add_object_patch(f"diffusion_model.{key}.data", new_tensor)
-                        else:
-                            logging.warning("ResAdapter: No match for key: %s", key)
-            except:
-                raise Exception("Could not patch model, this way of patching was added to ComfyUI on March 3rd 2024, is your ComfyUI up to date?")
-            logging.info("ResAdapter: Added resnet normalization patches")
-            return (model_clone, )
         
 class Superprompt:
     @classmethod
@@ -2179,7 +2140,7 @@ class ModelSaveKJ:
 
         load_models = [model]
 
-        model_management.load_models_gpu(load_models, force_patch_weights=True)
+        model_management.load_models_gpu(load_models)
         default_prefix = "model.diffusion_model."
 
         sd = model.state_dict_for_saving(None, None, None)
@@ -2248,7 +2209,7 @@ Concatenates the audio1 to audio2 in the specified direction.
         sample_rate_1 = audio1["sample_rate"]
         sample_rate_2 = audio2["sample_rate"]
         if sample_rate_1 != sample_rate_2:
-            raise Exception("Sample rates of the two audios do not match")
+            raise ValueError("Sample rates of the two audios do not match")
 
         waveform_1 = audio1["waveform"]
         waveform_2 = audio2["waveform"]
@@ -2450,12 +2411,19 @@ class VAELoaderKJ:
                 vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
             sd, metadata = load_torch_file(vae_path, return_metadata=True)
 
-        if "vocoder.conv_post.weight" in sd or "vocoder.vocoder.conv_post.weight" in sd:
-            from comfy.ldm.lightricks.vae.audio_vae import AudioVAE
-            vae = AudioVAE(sd, metadata)
+
+        is_audio_vae = (
+            "vocoder.conv_post.weight" in sd
+            or "vocoder.vocoder.conv_post.weight" in sd
+            or "vocoder.resblocks.0.convs1.0.weight" in sd
+            or "vocoder.vocoder.resblocks.0.convs1.0.weight" in sd
+        )
+        if is_audio_vae:
+            sd_audio = state_dict_prefix_replace(dict(sd), {"audio_vae.": "autoencoder.", "vocoder.": "vocoder."}, filter_keys=True)
+            vae = VAE(sd=sd_audio, metadata=metadata)
         else:
             vae = VAE(sd=sd, device=device, dtype=dtype, metadata=metadata)
-            vae.throw_exception_if_invalid()
+        vae.throw_exception_if_invalid()
         return (vae,)
 
 from comfy.samplers import sampling_function, CFGGuider
@@ -3272,7 +3240,7 @@ class VisualizeSigmasKJ(io.ComfyNode):
             buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
             buf = buf.reshape(h, w, 4)
             buf = buf[:, :, [1, 2, 3]]  # Convert ARGB to RGB
-        except:
+        except AttributeError:
             buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
             buf = buf.reshape(h, w, 3).copy()
         image = torch.from_numpy(buf).float() / 255.0
@@ -3310,3 +3278,80 @@ class PreviewLatentNoiseMask(io.ComfyNode):
             noise_mask = noise_mask[0, 0]
 
         return io.NodeOutput(noise_mask)
+
+class PlaySoundKJ(io.ComfyNode):
+    """Plays audio in the browser when execution reaches this node."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PlaySoundKJ",
+            category="KJNodes/audio",
+            description="Plays the input audio in the browser. Modes: 'always' plays on every execution, 'on_empty_queue' plays only when the queue finishes, 'on_change' plays only when the audio content changes. Duration limits playback length (0 = full audio).",
+            inputs=[
+                io.AnyType.Input("any_input", optional=True),
+                io.Audio.Input("audio", optional=True),
+                io.String.Input("audio_path", default="", tooltip="Path to an audio file. Used when audio input is not connected."),
+                io.Combo.Input("mode", options=["always", "on_empty_queue", "on_change"], default="always"),
+                io.Float.Input("volume", default=0.5, min=0.0, max=1.0, step=0.01),
+                io.Float.Input("duration", default=5.0, min=0.0, max=300.0, step=0.1, tooltip="Duration in seconds to play. 0 = play full audio."),
+            ],
+            outputs=[
+                io.AnyType.Output("any_output", display_name="any_output"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs):
+        if kwargs.get("mode") == "on_change":
+            return False
+        return float("NaN")
+
+    @staticmethod
+    def _generate_chime():
+        sr = 32000
+        C, Ab, Bb = 523.26, 421.30, 466.16  # note frequencies
+        e = 0.14  # eighth note — adjust to change tempo
+        S, M, H = 16, 7, 2.5  # staccato / medium / held decay
+        melody = [
+            (C,e,S), (C,e,S), (C,e,S), (C,e*3,M),
+            (Ab,e*3,M), (Bb,e*3,M), (C,e*2,S), (Bb,e,S), (C,e*5,H),
+        ]
+        k = torch.exp(-torch.linspace(-2, 2, 15) ** 2)
+        k = (k / k.sum()).reshape(1, 1, -1)
+        parts = []
+        for freq, dur, decay in melody:
+            t = torch.linspace(0, dur, int(sr * dur))
+            tone = torch.tanh(3 * torch.sin(2 * math.pi * freq * t))
+            tone = torch.nn.functional.conv1d(tone.reshape(1, 1, -1), k, padding=7).squeeze()
+            parts.append(tone * torch.exp(-t * decay))
+        wav = torch.cat(parts) * 0.45
+        return {"waveform": wav.unsqueeze(0).unsqueeze(0), "sample_rate": sr}
+
+    @classmethod
+    def execute(cls, audio=None, audio_path="", mode="always", volume=0.5, duration=5.0, any_input=None) -> io.NodeOutput:
+        if audio is None:
+            if audio_path:
+                import av
+                with av.open(audio_path) as af:
+                    stream = af.streams.audio[0]
+                    sr = stream.codec_context.sample_rate
+                    frames = []
+                    for frame in af.decode(streams=stream.index):
+                        buf = torch.from_numpy(frame.to_ndarray())
+                        if buf.shape[0] != stream.channels:
+                            buf = buf.view(-1, stream.channels).t()
+                        frames.append(buf)
+                    wav = torch.cat(frames, dim=1).float()
+                audio = {"waveform": wav.unsqueeze(0), "sample_rate": sr}
+            else:
+                audio = cls._generate_chime()
+
+        preview = ui.PreviewAudio(audio, cls=cls)
+        ui_dict = preview.as_dict()
+        ui_dict["audio_hash"] = [hash(audio["waveform"].sum().item())]
+        return io.NodeOutput(
+            any_input,
+            ui=ui_dict,
+        )

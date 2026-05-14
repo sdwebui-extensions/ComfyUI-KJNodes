@@ -1,4 +1,5 @@
 const { app } = window.comfyAPI.app;
+import { typesCompatible, clientToCanvas, getNodeAtPoint } from "./utility.js";
 
 let swapTargetNode = null;
 let swapDraggedNode = null;
@@ -6,22 +7,6 @@ let swapDragStartPos = null;
 let swapAnimating = false;
 let swapHasMoved = false;
 let swapKeyDown = false;
-
-function typesCompatible(a, b) {
-	if (a === "*" || b === "*") return true;
-	if (a === b) return true;
-	if (typeof a === "string" && typeof b === "string" && a.toUpperCase() === b.toUpperCase()) return true;
-	return false;
-}
-
-/** Convert client (screen) coordinates to graph (canvas) coordinates */
-function clientToCanvas(lgCanvas, clientX, clientY) {
-	const rect = lgCanvas.canvas.getBoundingClientRect();
-	return [
-		(clientX - rect.left) / lgCanvas.ds.scale - lgCanvas.ds.offset[0],
-		(clientY - rect.top) / lgCanvas.ds.scale - lgCanvas.ds.offset[1],
-	];
-}
 
 /** Find the topmost node whose bounding box overlaps with draggedNode */
 function getOverlappingNode(graph, draggedNode) {
@@ -43,13 +28,6 @@ function getOverlappingNode(graph, draggedNode) {
 	return null;
 }
 
-/** Find the node at a specific canvas point */
-function getNodeAtPoint(graph, cx, cy) {
-	for (let i = graph._nodes.length - 1; i >= 0; i--) {
-		if (graph._nodes[i].isPointInside(cx, cy)) return graph._nodes[i];
-	}
-	return null;
-}
 
 function startHighlightAnim(lgCanvas) {
 	if (swapAnimating) return;
@@ -83,6 +61,7 @@ function snapshotConnections(graph, node) {
 		inputs.push({
 			slotIndex: i,
 			type: inp.type,
+			name: inp.name,
 			originNodeId: link.origin_id,
 			originSlot: link.origin_slot,
 		});
@@ -97,7 +76,7 @@ function snapshotConnections(graph, node) {
 			.filter(Boolean)
 			.map((link) => ({ targetNodeId: link.target_id, targetSlot: link.target_slot }));
 		if (targets.length > 0) {
-			outputs.push({ slotIndex: o, type: out.type, targets });
+			outputs.push({ slotIndex: o, type: out.type, name: out.name, targets });
 		}
 	}
 
@@ -117,42 +96,71 @@ function disconnectAll(node) {
 	}
 }
 
-// Find a compatible slot on node, preferring sameIndex. Returns -1 if none found.
-// For inputs, isAvailable checks link == null and usedInputs; for outputs, always true.
-function findCompatibleSlot(slots, type, sameIndex, isAvailable) {
-	if (!slots) return -1;
-	if (sameIndex < slots.length && isAvailable(sameIndex) && typesCompatible(type, slots[sameIndex].type)) {
-		return sameIndex;
+// Map each snapshot entry → a new-node slot. Name matches win first, then sameIndex,
+// then first compatible. Each slot is claimed at most once so fallbacks can't stomp matches.
+function resolveAssignments(snapshots, slots, isFree) {
+	const assignments = new Map();
+	if (!slots || !slots.length) return assignments;
+	const used = new Set();
+
+	for (const snap of snapshots) {
+		if (!snap.name) continue;
+		const nameLower = String(snap.name).toLowerCase();
+		for (let s = 0; s < slots.length; s++) {
+			if (used.has(s) || !isFree(s)) continue;
+			const slotName = slots[s].name;
+			if (slotName && String(slotName).toLowerCase() === nameLower &&
+				typesCompatible(snap.type, slots[s].type)) {
+				assignments.set(snap, s);
+				used.add(s);
+				break;
+			}
+		}
 	}
-	for (let s = 0; s < slots.length; s++) {
-		if (isAvailable(s) && typesCompatible(type, slots[s].type)) return s;
+
+	for (const snap of snapshots) {
+		if (assignments.has(snap)) continue;
+		const i = snap.slotIndex;
+		if (i < slots.length && !used.has(i) && isFree(i) &&
+			typesCompatible(snap.type, slots[i].type)) {
+			assignments.set(snap, i);
+			used.add(i);
+			continue;
+		}
+		for (let s = 0; s < slots.length; s++) {
+			if (used.has(s) || !isFree(s)) continue;
+			if (typesCompatible(snap.type, slots[s].type)) {
+				assignments.set(snap, s);
+				used.add(s);
+				break;
+			}
+		}
 	}
-	return -1;
+
+	return assignments;
 }
 
 // Reconnect external connections from a snapshot onto newNode.
-// Tries same-slot first, then scans for a compatible free slot by type.
 function reconnectExternal(graph, snapshot, newNode, otherNodeId) {
-	const usedInputs = new Set();
+	const inputAssignments = resolveAssignments(
+		snapshot.inputs, newNode.inputs || [],
+		(s) => newNode.inputs[s].link == null,
+	);
 	for (const inp of snapshot.inputs) {
 		if (inp.originNodeId === otherNodeId) continue;
+		if (!inputAssignments.has(inp)) continue;
 		const originNode = graph.getNodeById(inp.originNodeId);
 		if (!originNode) continue;
-		const slot = findCompatibleSlot(
-			newNode.inputs, inp.type, inp.slotIndex,
-			(s) => !usedInputs.has(s) && newNode.inputs[s].link == null,
-		);
-		if (slot === -1) continue;
-		originNode.connect(inp.originSlot, newNode, slot);
-		usedInputs.add(slot);
+		originNode.connect(inp.originSlot, newNode, inputAssignments.get(inp));
 	}
 
+	const outputAssignments = resolveAssignments(
+		snapshot.outputs, newNode.outputs || [],
+		() => true,
+	);
 	for (const out of snapshot.outputs) {
-		const bestSlot = findCompatibleSlot(
-			newNode.outputs, out.type, out.slotIndex,
-			() => true,
-		);
-		if (bestSlot === -1) continue;
+		if (!outputAssignments.has(out)) continue;
+		const bestSlot = outputAssignments.get(out);
 		for (const tgt of out.targets) {
 			if (tgt.targetNodeId === otherNodeId) continue;
 			const targetNode = graph.getNodeById(tgt.targetNodeId);
